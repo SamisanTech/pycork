@@ -121,6 +121,6 @@ CORK_EXPORT void computeSymmetricDifference(CorkTriMesh in0, CorkTriMesh in1, Co
 //  No portion of either surface is deleted.  However, the
 //  curve of intersection between the two surfaces is made explicit,
 //  such that the two surfaces are now connected.
-CORK_EXPORT void resolveIntersections(CorkTriMesh in0, CorkTriMesh in1, CorkTriMesh *out);
+CORK_EXPORT void resolveIntersections(CorkTriMesh in0, CorkTriMesh *out);
 
 #endif

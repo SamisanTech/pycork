@@ -25,7 +25,7 @@ add_definitions("-DNOMINMAX -DFMT_HEADER_ONLY  -DCORK_DEBUG -DANSI_DECLARATORS -
 
 # removed -DCPU86
 
-option(BUILD_PYTHON "Builds a python extension" ON)
+option(BUILD_PYTHON "Builds a python extension" OFF)
 
 if(WIN32)
     # Remove Security definitions for the library

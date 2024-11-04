@@ -278,11 +278,11 @@ int main(int argc, char *argv[])
     "                       and output the result\n"
     "                       (aka. the symmetric difference)",
     genericBinaryOp(computeSymmetricDifference));
-    cmds.regCmd("resolve",
-    "-resolve in0 in1 out   Intersect the two meshes in0 and in1,\n"
-    "                       and output the connected mesh with those\n"
-    "                       intersections made explicit and connected",
-    genericBinaryOp(resolveIntersections));
+    // cmds.regCmd("resolve",
+    // "-resolve in0 in1 out   Intersect the two meshes in0 and in1,\n"
+    // "                       and output the connected mesh with those\n"
+    // "                       intersections made explicit and connected",
+    // genericBinaryOp(resolveIntersections));
     
     
     cmds.runCommands(arg_it, args.end());

@@ -26,6 +26,9 @@
 #ifndef CORK_PRELUDE_H_HEADER_HAS_BEEN_INCLUDED
 #define CORK_PRELUDE_H_HEADER_HAS_BEEN_INCLUDED
 
+#define _USE_MATH_DEFINES
+
+#include <math.h>
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
@@ -33,6 +36,7 @@
 #include <iostream>
 
 #ifdef _WIN32
+#define NOMINMAX
 #include <winsock.h>
 #endif
 

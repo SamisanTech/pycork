@@ -613,7 +613,7 @@ add_library(mpir SHARED ${ALL_FILES})
 
 #install(TARGETS mpir DESTINATION lib)
 #install(TARGETS mpir DESTINATION bin)
-install(FILES "${PROJECT_BINARY_DIR}/mpir.h" "${PROJECT_BINARY_DIR}/gmp.h" "${PROJECT_BINARY_DIR}/gmpxx.h" "${PROJECT_BINARY_DIR}/mpirxx.h"
+install(FILES "${PROJECT_BINARY_DIR}/mpir/mpir.h" "${PROJECT_BINARY_DIR}/mpir/gmp.h" "${PROJECT_BINARY_DIR}/mpir/gmpxx.h" "${PROJECT_BINARY_DIR}/mpir/mpirxx.h"
   DESTINATION include
   )
 

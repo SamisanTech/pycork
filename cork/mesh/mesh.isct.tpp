@@ -620,7 +620,7 @@ public:
         uint write = 0;
         TopoCache::verts.for_each([&](Vptr v) {
 #ifdef _WIN32
-            Vec3d raw = mesh->verts[v->ref].pos;
+            Vec3d raw = this->mesh->verts[v->ref].pos;
 #else
             Vec3d raw = TopoCache::mesh->verts[v->ref].pos;
 #endif
@@ -1035,21 +1035,21 @@ void Mesh<VertData,TriData>::IsctProblem::reset()
 template<class VertData, class TriData>
 void Mesh<VertData,TriData>::IsctProblem::findIntersections()
 {
-    int nTrys = 5;
-    perturbPositions(); // always perturb for safety...
-    while(nTrys > 0) {
-        if(!tryToFindIntersections()) {
-            reset();
-            perturbPositions();
-            nTrys--;
-        } else {
-            break;
-        }
-    }
-    if(nTrys <= 0) {
-        CORK_ERROR("Ran out of tries to perturb the mesh");
-        exit(1);
-    }
+    // int nTrys = 5;
+    // perturbPositions(); // always perturb for safety...
+    // while(nTrys > 0) {
+    //     if(!tryToFindIntersections()) {
+    //         reset();
+    //         perturbPositions();
+    //         nTrys--;
+    //     } else {
+    //         break;
+    //     }
+    // }
+    // if(nTrys <= 0) {
+    //     CORK_ERROR("Ran out of tries to perturb the mesh");
+    //     exit(1);
+    // }
     
     // ok all points put together,
     // all triangle problems assembled.

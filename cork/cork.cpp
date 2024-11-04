@@ -301,16 +301,13 @@ void computeSymmetricDifference(CorkTriMesh in0, CorkTriMesh in1, CorkTriMesh *o
     corkMesh2CorkTriMesh(&cmIn0, out);
 }
 
-void resolveIntersections(CorkTriMesh in0, CorkTriMesh in1, CorkTriMesh *out) {
+void resolveIntersections(CorkTriMesh in0, CorkTriMesh *out) {
 
-    CorkMesh cmIn0, cmIn1;
+    CorkMesh cmIn0;
 
     corkTriMesh2CorkMesh(in0, &cmIn0);
-    corkTriMesh2CorkMesh(in1, &cmIn1);
     
-    cmIn0.disjointUnion(cmIn1);
     cmIn0.resolveIntersections();
     
     corkMesh2CorkTriMesh(&cmIn0, out);
 }
-
