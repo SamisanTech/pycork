@@ -27,6 +27,8 @@
 #ifndef CORK_AABVH_H_HEADER_HAS_BEEN_INCLUDED
 #define CORK_AABVH_H_HEADER_HAS_BEEN_INCLUDED
 
+#include <CORK_EXPORT.h>
+
 #include <stack>
 #include <vector>
 #include <functional>
@@ -39,7 +41,7 @@
 static const uint LEAF_SIZE = 8;
 
 template<class GeomIdx>
-struct GeomBlob
+struct CORK_EXPORT GeomBlob
 {
     BBox3d  bbox;
     Vec3d   point; // representative point, usually the box midpoint
@@ -47,7 +49,7 @@ struct GeomBlob
 };
 
 template<class GeomIdx>
-struct AABVHNode
+struct CORK_EXPORT AABVHNode
 {
     BBox3d                          bbox;
     AABVHNode                       *left;

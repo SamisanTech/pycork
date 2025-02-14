@@ -28,43 +28,44 @@
 #define CORK_EMPTY3D_H_HEADER_HAS_BEEN_INCLUDED
 
 #include <cork/math/vec.h>
+#include <CORK_EXPORT.h>
 
 namespace empty3d {
 
-struct TriIn
+CORK_EXPORT struct TriIn
 {
     Vec3d p[3];
 };
 
-struct EdgeIn
+CORK_EXPORT struct EdgeIn
 {
     Vec3d p[2];
 };
 
-struct TriEdgeIn
+CORK_EXPORT struct TriEdgeIn
 {
     TriIn   tri;
     EdgeIn  edge;
 };
 
-bool isEmpty(const TriEdgeIn &input);
-Vec3d coords(const TriEdgeIn &input);
-bool emptyExact(const TriEdgeIn &input);
-Vec3d coordsExact(const TriEdgeIn &input);
+CORK_EXPORT bool isEmpty(const TriEdgeIn &input);
+CORK_EXPORT Vec3d coords(const TriEdgeIn &input);
+CORK_EXPORT bool emptyExact(const TriEdgeIn &input);
+CORK_EXPORT Vec3d coordsExact(const TriEdgeIn &input);
 
-struct TriTriTriIn
+CORK_EXPORT struct TriTriTriIn
 {
     TriIn tri[3];
 };
 
-bool isEmpty(const TriTriTriIn &input);
-Vec3d coords(const TriTriTriIn &input);
-bool emptyExact(const TriTriTriIn &input);
-Vec3d coordsExact(const TriTriTriIn &input);
+CORK_EXPORT bool isEmpty(const TriTriTriIn &input);
+CORK_EXPORT Vec3d coords(const TriTriTriIn &input);
+CORK_EXPORT bool emptyExact(const TriTriTriIn &input);
+CORK_EXPORT Vec3d coordsExact(const TriTriTriIn &input);
 
-extern int degeneracy_count; // count degeneracies encountered
-extern int exact_count; // count of filter calls failed
-extern int callcount; // total call count
+CORK_EXPORT extern int degeneracy_count; // count degeneracies encountered
+CORK_EXPORT extern int exact_count; // count of filter calls failed
+CORK_EXPORT extern int callcount; // total call count
 
 /*
 // exact versions

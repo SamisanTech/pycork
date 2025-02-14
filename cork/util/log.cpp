@@ -58,7 +58,7 @@ void logInit()
 }
 
 // exposes the error log for writing
-std::ostream& err()
+CORK_EXPORT std::ostream& err()
 {
     static bool first = true;
     if(first) {

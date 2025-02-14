@@ -27,6 +27,7 @@
 #ifndef CORK_QUANTIZATION_H_HEADER_HAS_BEEN_INCLUDED
 #define CORK_QUANTIZATION_H_HEADER_HAS_BEEN_INCLUDED
 
+#include <CORK_EXPORT.h>
 #include <cmath>
 
 namespace quantization {
@@ -34,8 +35,8 @@ namespace quantization {
 // NOTE: none of these values should be modified by the clients
 static const int BITS = 30;
 // MAGNIFY * RESHRINK == 1
-extern double MAGNIFY;
-extern double RESHRINK;
+CORK_EXPORT extern double MAGNIFY;
+CORK_EXPORT extern double RESHRINK;
 
 inline int quantize2int(double number) {
     return int(number * MAGNIFY);

@@ -54,7 +54,7 @@ typedef unsigned char byte;
 // * Logging
 
 // error log -- silent; will not stop program
-std::ostream &err();
+CORK_EXPORT std::ostream &err();
 
 #ifndef ENSURE
 #define ENSURE(STATEMENT) { \

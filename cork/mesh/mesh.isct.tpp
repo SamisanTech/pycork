@@ -25,6 +25,8 @@
 // +-------------------------------------------------------------------------
 #pragma once
 
+#include <chrono>
+
 struct GenericVertType;
     struct IsctVertType;
     struct OrigVertType;
@@ -793,7 +795,7 @@ public:
     
     bool hasIntersections(); // test for iscts, exit if one is found
     
-    void findIntersections();
+    bool findIntersections();
     void resolveAllIntersections();
 private:
     // if we encounter ambiguous degeneracies, then this
@@ -1001,7 +1003,7 @@ bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
 template<class VertData, class TriData>
 void Mesh<VertData,TriData>::IsctProblem::perturbPositions()
 {
-    const double EPSILON = 1.0e-5; // perturbation epsilon
+    const double EPSILON = 1.0e-6; // perturbation epsilon
     for(Vec3d &coord : quantized_coords) {
         Vec3d perturbation(quantization::quantize(drand(-EPSILON, EPSILON)),
                            quantization::quantize(drand(-EPSILON, EPSILON)),
@@ -1033,7 +1035,7 @@ void Mesh<VertData,TriData>::IsctProblem::reset()
 }
 
 template<class VertData, class TriData>
-void Mesh<VertData,TriData>::IsctProblem::findIntersections()
+bool Mesh<VertData,TriData>::IsctProblem::findIntersections()
 {
     // int nTrys = 5;
     // perturbPositions(); // always perturb for safety...
@@ -1047,8 +1049,7 @@ void Mesh<VertData,TriData>::IsctProblem::findIntersections()
     //     }
     // }
     // if(nTrys <= 0) {
-    //     CORK_ERROR("Ran out of tries to perturb the mesh");
-    //     exit(1);
+    //     return false;
     // }
     
     // ok all points put together,
@@ -1058,6 +1059,7 @@ void Mesh<VertData,TriData>::IsctProblem::findIntersections()
     tprobs.for_each([&](Tprob tprob) {
         tprob->consolidate(this);
     });
+    return true;
 }
 
 template<class VertData, class TriData>
@@ -1487,17 +1489,22 @@ void Mesh<VertData,TriData>::testingComputeStaticIsct(
 }
 
 template<class VertData, class TriData>
-void Mesh<VertData,TriData>::resolveIntersections()
+bool Mesh<VertData,TriData>::resolveIntersections()
 {
     IsctProblem iproblem(this);
-    
-    iproblem.findIntersections();
+
+    auto start = std::chrono::system_clock::now();
+
+    if (!iproblem.findIntersections())
+        return false;
+
+    start = std::chrono::system_clock::now();
     
     iproblem.resolveAllIntersections();
-    
+
     iproblem.commit();
-    
-    //iproblem.print();
+
+    return true;
 }
 
 template<class VertData, class TriData>
