@@ -1004,12 +1004,12 @@ template<class VertData, class TriData>
 void Mesh<VertData,TriData>::IsctProblem::perturbPositions()
 {
     const double EPSILON = 1.0e-6; // perturbation epsilon
-    for(Vec3d &coord : quantized_coords) {
-        Vec3d perturbation(quantization::quantize(drand(-EPSILON, EPSILON)),
-                           quantization::quantize(drand(-EPSILON, EPSILON)),
-                           quantization::quantize(drand(-EPSILON, EPSILON)));
-        coord += perturbation;
-    }
+    // for(Vec3d &coord : quantized_coords) {
+    //     Vec3d perturbation(quantization::quantize(drand(-EPSILON, EPSILON)),
+    //                        quantization::quantize(drand(-EPSILON, EPSILON)),
+    //                        quantization::quantize(drand(-EPSILON, EPSILON)));
+    //     coord += perturbation;
+    // }
 }
 
 template<class VertData, class TriData>
@@ -1037,20 +1037,20 @@ void Mesh<VertData,TriData>::IsctProblem::reset()
 template<class VertData, class TriData>
 bool Mesh<VertData,TriData>::IsctProblem::findIntersections()
 {
-    // int nTrys = 5;
-    // perturbPositions(); // always perturb for safety...
-    // while(nTrys > 0) {
-    //     if(!tryToFindIntersections()) {
-    //         reset();
-    //         perturbPositions();
-    //         nTrys--;
-    //     } else {
-    //         break;
-    //     }
-    // }
-    // if(nTrys <= 0) {
-    //     return false;
-    // }
+    int nTrys = 5;
+    perturbPositions(); // always perturb for safety...
+    while(nTrys > 0) {
+        if(!tryToFindIntersections()) {
+            reset();
+            perturbPositions();
+            nTrys--;
+        } else {
+            break;
+        }
+    }
+    if(nTrys <= 0) {
+        return false;
+    }
     
     // ok all points put together,
     // all triangle problems assembled.
@@ -1498,13 +1498,18 @@ bool Mesh<VertData,TriData>::resolveIntersections()
     if (!iproblem.findIntersections())
         return false;
 
+    std::cout << "Time to find intersections : " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - start).count() << " ms" << std::endl;
     start = std::chrono::system_clock::now();
     
     iproblem.resolveAllIntersections();
-
+    
+    std::cout << "Time to resolve them : " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - start).count() << " ms" << std::endl;
+    
     iproblem.commit();
-
+    
+    //iproblem.print();
     return true;
+    //iproblem.print();
 }
 
 template<class VertData, class TriData>
