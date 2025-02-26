@@ -94,6 +94,8 @@ CORK_EXPORT void corkMesh2Eigen(const CorkMesh &mesh,
 
 CORK_EXPORT void freeCorkTriMesh(CorkTriMesh *mesh);
 
+CORK_EXPORT void corkMesh2CorkTriMesh(CorkMesh *mesh_in, CorkTriMesh *out);
+
 // the inputs to Boolean operations must be "solid":
 //  -   closed (aka. watertight; see comment at bottom)
 //  -   non-self-intersecting

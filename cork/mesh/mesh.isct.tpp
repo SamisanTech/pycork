@@ -1004,12 +1004,12 @@ template<class VertData, class TriData>
 void Mesh<VertData,TriData>::IsctProblem::perturbPositions()
 {
     const double EPSILON = 1.0e-6; // perturbation epsilon
-    // for(Vec3d &coord : quantized_coords) {
-    //     Vec3d perturbation(quantization::quantize(drand(-EPSILON, EPSILON)),
-    //                        quantization::quantize(drand(-EPSILON, EPSILON)),
-    //                        quantization::quantize(drand(-EPSILON, EPSILON)));
-    //     coord += perturbation;
-    // }
+    for(Vec3d &coord : quantized_coords) {
+        Vec3d perturbation(quantization::quantize(drand(-EPSILON, EPSILON)),
+                           quantization::quantize(drand(-EPSILON, EPSILON)),
+                           quantization::quantize(drand(-EPSILON, EPSILON)));
+        coord += perturbation;
+    }
 }
 
 template<class VertData, class TriData>
