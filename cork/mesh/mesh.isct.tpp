@@ -1493,17 +1493,17 @@ bool Mesh<VertData,TriData>::resolveIntersections()
 {
     IsctProblem iproblem(this);
 
-    auto start = std::chrono::system_clock::now();
+    // auto start = std::chrono::system_clock::now();
 
     if (!iproblem.findIntersections())
         return false;
 
-    std::cout << "Time to find intersections : " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - start).count() << " ms" << std::endl;
-    start = std::chrono::system_clock::now();
+    // std::cout << "Time to find intersections : " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - start).count() << " ms" << std::endl;
+    // start = std::chrono::system_clock::now();
     
     iproblem.resolveAllIntersections();
     
-    std::cout << "Time to resolve them : " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - start).count() << " ms" << std::endl;
+    // std::cout << "Time to resolve them : " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - start).count() << " ms" << std::endl;
     
     iproblem.commit();
     
