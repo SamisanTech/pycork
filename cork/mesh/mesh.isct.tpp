@@ -857,7 +857,7 @@ public:
 
     bool hasIntersections(); // test for iscts, exit if one is found
 
-    bool findIntersections();
+    bool findIntersections(double epsi = 1.0e-4);
     void resolveAllIntersections();
 
 private:
@@ -865,7 +865,7 @@ private:
     // routine returns false, indicating that the computation aborted.
     bool tryToFindIntersections();
     // In that case, we can perturb the positions of points
-    void perturbPositions();
+    void perturbPositions(double epsi = 1.0e-4);
     // in order to give things another try, discard partial work
     void reset();
 
@@ -1073,9 +1073,8 @@ bool Mesh<VertData, TriData>::IsctProblem::tryToFindIntersections()
 }
 
 template <class VertData, class TriData>
-void Mesh<VertData, TriData>::IsctProblem::perturbPositions()
+void Mesh<VertData, TriData>::IsctProblem::perturbPositions(double EPSILON)
 {
-    const double EPSILON = 1.0e-6; // perturbation epsilon
     for (Vec3d &coord : quantized_coords)
     {
         Vec3d perturbation(quantization::quantize(drand(-EPSILON, EPSILON)),
@@ -1108,16 +1107,16 @@ void Mesh<VertData, TriData>::IsctProblem::reset()
 }
 
 template <class VertData, class TriData>
-bool Mesh<VertData, TriData>::IsctProblem::findIntersections()
+bool Mesh<VertData, TriData>::IsctProblem::findIntersections(double epsi)
 {
     int nTrys = 5;
-    perturbPositions(); // always perturb for safety...
+    perturbPositions(epsi); // always perturb for safety...
     while (nTrys > 0)
     {
         if (!tryToFindIntersections())
         {
             reset();
-            perturbPositions();
+            perturbPositions(epsi);
             nTrys--;
         }
         else
@@ -1593,13 +1592,13 @@ void Mesh<VertData, TriData>::testingComputeStaticIsct(
 }
 
 template <class VertData, class TriData>
-bool Mesh<VertData, TriData>::resolveIntersections()
+bool Mesh<VertData, TriData>::resolveIntersections(double epsi)
 {
     IsctProblem iproblem(this);
 
     // auto start = std::chrono::system_clock::now();
 
-    if (!iproblem.findIntersections())
+    if (!iproblem.findIntersections(epsi))
         return false;
 
     // std::cout << "Time to find intersections : " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - start).count() << " ms" << std::endl;
