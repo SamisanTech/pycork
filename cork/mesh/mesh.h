@@ -241,7 +241,7 @@ public: // REMESHING module
     RemeshOptions remesh_options;
 
 public:                                              // ISCT (intersections) module
-    bool resolveIntersections(double epsi = 1.0e-4); // makes all intersections explicit
+    bool resolveIntersections(double epsi = 5.0e-4); // makes all intersections explicit
     bool isSelfIntersecting();                       // is the mesh self-intersecting?
 
     void testingComputeStaticIsctPoints(std::vector<Vec3d> *points);
