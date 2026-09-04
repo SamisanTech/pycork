@@ -361,3 +361,411 @@ Verdict on 30.stl: the speed flags are irrelevant until Triangle can
 finish 851k intersection polygons. SI on this soup is ~10 s on the
 grid path (4.7B cell pairs). LBVH does not reduce hits and still
 loses to / ties the grid. No result STL written.
+
+================================================================
+ARCHITECTURE REFIT  2026-09-04  (plan + start)
+Goal: OOP facade so Mira-style repair can plug in later, without
+rewriting the 21.stl hot path or adding copies.
+
+What we will NOT do (delays / regressions):
+  - Do not retarget CorkMesh / exact SI / Triangle to float32.
+    Exact predicates stay double. "Template dtype" = Surface<S>
+    at the edges; one cast into CorkMesh.
+  - Do not move mesh.isct.tpp / mesh.bool.tpp / mesh.hull.tpp.
+  - Do not turn on cluster/puzzle/unify by default.
+  - Do not change resolveIntersection / outerHull call semantics.
+
+Target tree (new dirs only; kernels stay put):
+  cork/core/     Surface<S>, Scalar aliases
+  cork/io/       binary STL mmap read/write + weld
+  cork/repair/   Options + Pipeline (facade over CorkMesh)
+  cork/accel/    grid, LBVH, AVX   (existing)
+  cork/isct/     exact SI, Triangle (existing)
+  cork/mesh/     CorkMesh kernels  (existing)
+
+Class / API tree:
+  cork::Surface<S>          owning V(n,3) F(m,3), cast<D>()
+  cork::io::read_stl        -> Surface<float>  (file native)
+  cork::io::write_stl<S,I>  from any Scalar / index
+  cork::repair::Options     resolve=true, hull=false, unify=false
+  cork::repair::Pipeline    run(CorkMesh&, Options)  in-place
+  pycork.resolveIntersection / outerHull / union   UNCHANGED
+  pycork.repair(verts, tris, resolve=True, hull=False, ...)
+                            one CorkMesh build, then Pipeline
+
+Mira stages we already have vs later (default OFF):
+  have: weld (IO), resolve (grid SI+CDT), hull (rays), union
+  later: AABB cluster, hole-puzzle, SI-subset, obtuse collapse
+  skip: pyvista, Open3D scene, per-edge Delaunay, process=True
+
+21.stl gate after every step: IO+resolve+hull wall must stay
+inside prior band (power ~1.3s / battery ~2.0s). Resolve V/F
+band 714k / 1.60M. No extra Eigen copies on the old bindings.
+
+----------------------------------------------------------------
+IMPLEMENTED (first increment, kernels untouched)
+
+Directory tree (new vs existing):
+  cork/core/surface.h          NEW  Surface<S>  xyz + f, cast<D>()
+  cork/io/stl.h                NEW  mmap binary STL + bit weld
+  cork/repair/options.h        NEW  resolve / hull / unify flags
+  cork/repair/pipeline.h       NEW  Pipeline::run(CorkMesh&, Options)
+  cork/accel/  cork/isct/  cork/mesh/   UNCHANGED
+  python/pycork/module.cpp     thin: IO calls cork::io; + repair()
+  python/pycork/__init__.py    API list
+
+Class tree:
+  cork::Surface<S>
+  cork::io::read_stl / write_stl<S,I>
+  cork::repair::Options
+  cork::repair::Pipeline
+  CorkMesh                     (double kernels, exact SI)
+
+Callable APIs (optional params):
+  pycork.readSTL(path)
+  pycork.writeSTL(path, verts, tris)     forcecast any dtype
+  pycork.resolveIntersection(verts, tris)
+  pycork.outerHull(verts, tris, raysPerPatch=5, resolve=True)
+  pycork.repair(verts, tris, resolve=True, hull=False,
+                unify=False, raysPerPatch=5)
+  pycork.union / difference / intersection / isSolid
+
+Dtype policy: Surface<S> at the edges. CorkMesh stays double.
+Do not retarget predicates to float32 (would regress + delay).
+
+----------------------------------------------------------------
+21.stl GATE after this increment  (warm, no flags)
+FILE E:\github.com\SamisanTech\slc_stl\tests\data\21.stl
+INPUT V=631,213 F=1,261,664  open=0 nm=2
+
+  IO in              0.086 s   (was 0.075; extra Surface->numpy copy)
+  resolve            0.841 s   (was 0.82 power / 1.41 battery)
+  hull resolve=False 0.390 s   (was 0.34 / 0.44)
+  IO out             0.087 s   (was 0.068)
+  IO+resolve+hull    1.317 s   (was 1.30 power / 2.00 battery)
+
+  resolve  V=714,506 F=1,595,632  open=0 nm=84,119  vol=556.736
+  hull     V=465,019 F=930,658    open=0 nm=0  watertight=True
+           vol=484.637  (restored; last PSLG-only log was open=122)
+
+  pycork.repair(resolve=True)  0.912 s  V=714,708 F=1,595,399
+           (own perturbation; same band)
+
+Verdict: KEEP. No kernel regression. Hull watertight again because
+the bench now hulls the already-resolved mesh (no second resolve).
+unify / cluster / puzzle still reserved (default OFF).
+
+================================================================
+MIRA REPAIR INVESTIGATION  2026-09-05 00:28
+Repo E:\github.com\SamisanTech\Mira3D
+Branch mira-admin/issue-98-ctrl-f-speed-up  HEAD 0444887
+  "Revert Exact-repair SI simplify in repair_thread.py only."
+
+LIVE AUTO-REPAIR = OLD ROBUST PATH
+  main.py NEW_REPAIR = False  (license may flip later)
+  repair_worker_fn:
+    weld copy (old path needs welded verts)
+    retry x2
+    if NEW_REPAIR and manifold available → manifold_repair.repair_mesh
+    else → repair_thread(...)     <<< THIS IS WHAT RUNS
+
+PARKED EXPERIMENTAL (not live)
+  1) Branch new_repair + src/manifold_repair.py + mesh_repair.cpp
+     TryOuterFromSoup: preprocess, MS puzzle, leftoverOpen→SI,
+     huge-soup batches, BatchBoolean, noise strip.
+     Entry: _m3d.repair() when NEW_REPAIR=True.
+  2) Commit 0134d63 (reverted tonight in repair_thread only)
+     Kept repair_thread shell split / puzzle, then replaced the
+     Exact tail with manifold_repair.union_all:
+       skip easy/hard, skip pycork SI-subset, skip ohebvh2 x2,
+       skip graph_collapse, skip box-ray hull, skip post_repair_fix.
+     Perturb was 1e-4 (now restored to 1e-3).
+  Manual Repair (Ctrl+F) Manifold inspect/NM split was NOT reverted.
+
+OLD ROBUST repair_thread  (the spec)
+  1  weld + drop dup/degen/unref
+  2  pyvista decimate slivers (extent<0.004, factor cap 0.8)
+  3  split(only_watertight=False)  face-adjacency shells
+  4  AABB cluster via mira_utils_mesh.connection_matrix
+  5  per cluster:
+     invert if volume<0
+     closed: perturb toward cluster COM (1e-3 * rand)
+     open: hole-vertex puzzle (EC 0/1), HoleFix tiny holes,
+           leftover: noise, Open3D signed-distance inner drop,
+           optional stitchkaroinko (Delaunay)
+     repair_open_shells: perturb (must) → drop dups →
+       resolveIntersectionbvh2 (SI faces only + pycork) →
+       merge_vertices (26 lion) → ohebvh2_box →
+       reducemesh obtuse (22.stl) → fillholes_nc
+     image-compare gate (abort if silhouette changed)
+     simple mode: invert+concat, skip Exact
+     easy vs hard: AABB degree > 30
+       hard: extra decimate + pairwise pycork.union (Boolean)
+       easy: perturb + decimate + remove_noise (else cork crash)
+             + resolveIntersectionbvh2
+             + ohebvh2 x2 + graph_collapse (must)
+             + box-ray outer hull + area filter
+     image-compare again
+  6  concat clusters
+  7  mira_repair.post_repair_fix(6, 3)
+
+pycork already has: weld(IO), resolve, outerHull, union
+old Mira still needs (defaults OFF in our Pipeline):
+  SI-subset (intersecting faces only)
+  AABB cluster + easy/hard
+  COM / random perturb (must, holes if too small)
+  hole puzzle + HoleFix
+  ohe (not our winding hull; theirs is embree/bvh patch keep)
+  graph_collapse short-edge weld
+  pairwise closed union
+  remove_noise (tiny/planar comps)
+skip for pycork: pyvista, Open3D scene, stitch Delaunay,
+  process=True, image gate, post_repair_fix native
+
+----------------------------------------------------------------
+MIRA PYD MAP  (scripts/encrypt_pyds.py: pyd -> DLLs/*.dll)
+  mira_module.mesh     meshes.dll   external/mira_module
+      get_intersecting_faces, extract_outer_hull(_box),
+      collapse_edges, components, non_intersecting_clusters
+  mira.mira_mesh       base.dll     external/mira_mesh
+      comps / comps_d / extract_outer_hull_box (embree path)
+  mira_slicer          cutter.dll   external/mira_utils
+      connection_matrix / AABB graph
+  mira_repair          v3_rep.dll   src/wrappers/repair/repair_wrapper.cpp
+      post_repair_fix = weld + drop tiny/planar + HoleFix
+  pycork               unify.dll    external/cork  (this repo)
+  _holefix             holefix.dll  external/HoleFix
+  decimator            decimator.dll external/decimator
+  manifold_py          manifold3d.dll external/Manifold
+
+----------------------------------------------------------------
+ADDED to pycork Pipeline (all default OFF except resolve)
+  clean      mira_module.remove_degenerated + unref compact
+  perturb    helper_functions.perturb (along vertex normals)
+  noise      post_repair_fix / remove_noise (minFaces + not planar)
+  collapse   mira_module.collapse_edges (rel 0.02 * mean edge)
+  si_subset  get_intersecting_faces pattern: mark non-adjacent
+             AABB overlaps, resolve that soup, disjointUnion rest
+  hull / unify still optional / reserved
+
+21.stl GATE after this add  (warm, extra flags OFF)
+  IO in 0.108s  resolve 0.666s  hull 0.289s
+  IO+resolve+hull 1.063s  (prior 1.317 warm / 1.30 power)
+  resolve V=714,506 F=1,595,632
+  hull    V=465,019 F=930,658  same stats as last clean hull
+  repair(default) 0.703s V=714,708 F=1,595,399  flags all false
+Verdict: NO REGRESSION. Old 21.stl path untouched.
+
+----------------------------------------------------------------
+ADDED cluster / puzzle / unify  (mira_module + repair_thread)
+  cluster   face-adjacency shells + AABB groups, repair each
+  puzzle    merge opens that share hole verts (EC 0/1)
+  unify     easy/hard (degree>30); pairwise boolUnion on hard closed
+  COM perturb on closed shells when perturb+cluster
+  Stats: shells, clusters, closed, open, hard, unified, puzzled
+
+21.stl GATE after cluster add  (warm, extra flags OFF)
+  IO in 0.067s  resolve 0.600s  hull 0.263s
+  IO+resolve+hull 0.930s
+  resolve V=714,506 F=1,595,632
+  hull    V=465,019 F=930,658  same stats
+  repair(default) 0.658s same band, cluster stats 0
+  repair(cluster+puzzle) 2.178s  shells=275 clusters=1 closed=275
+      (copies + one resolve; not the 21.stl default)
+Verdict: NO REGRESSION. Cluster/unify stay opt-in.
+
+----------------------------------------------------------------
+repair() DEFAULT NOW INCLUDES OUR HULL  (not Mira ohebvh)
+  hull=true on Options and pycork.repair
+  Still Mesh::outerHull (winding). Do not port ohebvh / ohebvh2_box.
+
+21.stl after hull-on repair  (STLs written next to input)
+  IO+resolve+hull            0.997 s   V/F same band
+  repair() default           1.043 s   hull=True
+  repair(cluster+puzzle)     2.760 s   hull=True
+  Wrote 21_resolve.stl  21_hull.stl  21_repair.stl  21_repair_cluster.stl
+
+================================================================
+REPAIR PLAN  (Mira repair_thread, C++ / our hull / no magic cutoffs)
+
+  POLICY
+    Mira has every stage for a reason. It is just unoptimized Python
+    glue. Port the PURPOSE into OUR tree. We are clearing Mira — do
+    not keep their libs as forever dependencies if we only use a slice.
+
+    NEVER: ohebvh / ohebvh2 / ohebvh2_box — our winding hull is better.
+    NEVER vendor: whole HoleFix/TMesh, whole decimator, pyvista.
+
+    Dtype: Surface<S> at file/Python edges (already cork/core/surface.h).
+    Exact kernels stay double. New ops are template<class S> on Surface
+    or run on CorkMesh (double) after one cast.
+
+  HOLE FILL  (investigated — do not link HoleFix)
+    Mira fillholes_nc = holefix.fill_holes_only =
+      TMesh fixConnectivity + fillSmallBoundaries (+ optional invert).
+    That is NOT a small header. TMesh is a full linked mesh (List V/E/T,
+    forceNormalConsistence, refineSelectedHolePatches).
+    The PURPOSE is small and ours:
+      1) walk open-edge boundary loops
+      2) 3-cycles → one triangle  (already in mira_repair::fix_holes)
+      3) n-cycles → ear-clip or centroid-star  (TMesh StarTriangulateHole)
+    Lives at cork/repair/holes.h as fill_boundary_loops(Surface<S>&).
+    Call sites stay Mira's: puzzle (<=20 hole verts), open after hull,
+    hard-boolean largest shell, end pass.
+    3-cycle fill first; n-cycle star next. No TMesh, no _holefix.pyd.
+
+  OTHER ONE-SLICE MIRA LIBS  (same rule: rewrite the slice)
+    decimator / pyvista decimate → we have collapse_short_edges
+    mira_mesh_bvh.get_intersecting_faces → our si_subset (make default)
+    mira_module.collapse_edges → collapse already
+    mira_repair.post_repair_fix → weld + dups + tiny + fill_boundary_loops
+    invert_normals → swap when volume < 0 (already in split_shells)
+    connection_matrix → aabb_clusters already
+
+  Why Mira eats NM 20/21/26 and we do not:
+    Cork never sees the raw soup. Split first, closed/open fork,
+    SI-subset cork, HoleFix on leftover loops. Our cluster_repair
+    still concats a cluster and full-resolves — that is the gap.
+
+  DEFAULT PATH NOW
+  [x] weld             readSTL bit-weld
+  [x] pre-SI noise     exact dups + comps nFaces<=5 (FaceKey identity)
+  [x] resolve          FULL Mesh::resolveIntersections  ← Mira subsets
+  [x] hull             our winding outerHull + leftover 0.001*max
+  [x] cork fail        throw, not exit(1)
+
+  WRITTEN BUT WRONG FLOW / OFF
+  [~] cluster          split+AABB exist; then concat + full-resolve
+  [~] puzzle           EC 0/1 hole-vert merge; only if cluster
+  [~] unify            pairwise union; only if unify+hard
+  [~] si_subset        grid AABB overlap, not get_intersecting_faces
+  [~] collapse         exists; off (Mira after SI)
+  [~] clean / perturb  exist; OFF on whole mesh (opened slc 21)
+  [ ] fill_boundary_loops  ours (3-cycle then n-cycle star); not HoleFix
+
+  NEXT — Mira flow, our kernels
+  1. Split-first always (face-adj, minFaces=5)
+     invert negative closed; closed vs open fork
+  2. Cork = SI-subset (resolveIntersectionbvh2 purpose)
+     intersecting faces only; disjointUnion the rest
+     20/21/26 fix. slc 21 full-resolve only if almost all marked
+  3. Closed-only COM perturb (1e-3 toward cluster COM)
+     never jitter an unsplit body
+  4. Open path: puzzle → SI-subset → our hull
+     then fill_boundary_loops on leftover loops (Mira fillholes_nc purpose)
+  5. Easy/hard: AABB degree>30 → pairwise union; else concat
+     SI-subset + our hull; fill_boundary_loops on hard result
+  6. collapse after SI, before hull (graph_collapse purpose)
+  7. End: weld + dups + tiny + fill_boundary_loops
+     (post_repair_fix purpose, no ohebvh, no HoleFix)
+
+  slc 21.stl GATE after every step:
+    V=465,004 F=930,634 open=0 nm=0 1 shell wt vol=484.637
+  never: ohebvh, ohebvh2, ohebvh2_box
+
+One output file: {stem}_repair.stl
+
+21.stl after after-hull area noise  (noise=on, shells<0.001 max dropped)
+  repair 1.300 s  IO+repair 1.359 s
+  V=465,004 F=930,634  open=0 nm=0  shells=1  watertight  vol=484.637
+  (was 3 shells / 465,019 / 930,658 — dropped leftover scraps)
+  Wrote 21_repair.stl  46,531,784 bytes  (44.38 MB)
+
+----------------------------------------------------------------
+NOISE ON THE FLY  (inside hull §3b, no second walk)
+  leftover shells (area < 0.001 * max, incl. closed junk) folded into
+  the existing hull prune. drop_small_shells only if hull=off.
+  Zero-area punch on rebuild OPENED 21.stl (open=15) — reverted.
+
+21.stl after on-the-fly leftover drop
+  repair 0.939 s  IO+repair 1.000 s   (was 1.300 s extra pass)
+  V=465,004 F=930,634  open=0 nm=0  shells=1  watertight  vol=484.637
+  Wrote 21_repair.stl  46,531,784 bytes  (44.38 MB)
+
+  trimesh process=False on the STL: V=3*F (unwelded binary corners).
+  After merge_vertices: 2-face zero-area scrap + 1 dup is a weld
+  artifact. In-memory arrays (already welded) stay 1 shell / closed.
+  Dropping those zero-area faces from the body opens 15 edges.
+
+----------------------------------------------------------------
+CLOSER TO MIRA  (watch NM 20/21/26 failures)
+  Why they fail (not size):
+    21 NM  cork exit(1) perturb retries. 256 dups + 398 tiny scraps.
+            Now throws instead of killing the process. Pre-SI noise
+            unblocks it (0.74s) — leftover open/nm, 4 shells.
+    20 NM  valence-52 from ~16k 1-face scraps + 14k dups, plus 4
+            neighboring copies in one AABB pile. Not too big.
+    26     2.9M faces / 9.5GB SI — still unresolved.
+  Pieces on:
+    pre-SI drop_noise = exact duplicate faces + comps with
+      nFaces <= 5. No planar-vs-first-face (punches bodies).
+      FaceKey is identity, not a hash (hash collisions opened slc 21).
+    hull leftover area still on the fly.
+    cork perturb-fail throws, does not exit(1).
+  Pieces NOT default: clean / whole-mesh perturb (opened slc 21).
+    cluster-on does not help until we stop concating back to one soup.
+  slc 21.stl GATE after this
+    repair 1.52s  V=465,004 F=930,634  open=0 nm=0  1 shell  wt
+    vol=484.637  (same quality; component walk always runs)
+
+----------------------------------------------------------------
+FLOW LOOP  (split-first / SI-subset / fill)
+  fill_boundary_loops in cork/repair/holes.h (no TMesh):
+    3-cycles always; n-cycle centroid-star only if hole verts <= 20
+    (Mira puzzle fillholes_nc cutoff). Star-capping hull rims
+    wrecked NM 6.stl volume (231 -> 3.7).
+  Tried always split-first + SI-subset cork: slc 21 DESTROYED
+    5.1s  V=326k F=664k open=219 nm=5.8k  21 shells  vol=416.
+    si_subset alone same class of damage (AABB overlap != Mira
+    get_intersecting_faces). Reverted both as defaults.
+  cluster + FULL resolve: slc 21 still wt 1 shell vol=484.637
+    V/F wobble 465243/931112  3.5s. Opt-in. Fork opens vs closed.
+  DEFAULT NOW: pre-SI noise + full resolve + our hull + leftover
+    + fill_boundary_loops (3-cycle / <=20 star)
+  slc 21 GATE  2.00s  465,004 / 930,634  open=0  1 shell  wt  484.637
+
+----------------------------------------------------------------
+UNDER 1s  (skip walks Mira never pays on a closed soup)
+  fill only if hull prune left a boundary (HullStats.closed).
+  pre-SI drop_noise only after cork throws (Mira: noise or cork crashes).
+  slc 21  0.954s  same gate 465,004 / 930,634  wt  484.637
+  NM 21  throw → strip dups/tiny → retry  0.99s  (no longer exit(1))
+  NM 29  0.008s solid
+  NM 13  268 nm -> 0, 298 open -> 66  (was leftover rim)
+  NM 29  still solid
+  NM 21  still completes (~0.8s), leftover opens/nm, 5 shells
+  STLs in Non Manifold/pycork_repair/
+
+----------------------------------------------------------------
+MORE FILE LOOP  (NM + Stitching + Impossible)
+  slc 21 GATE  0.903 .. 1.069 s  465,004 / 930,634  wt  484.637
+
+  Tried default close_leftover after hull (weld identical verts +
+  dups + puzzle hole-sharing opens + fill). Quality UNCHANGED on
+  every leftover-rim file; time 10-100x (NM 13 0.16→7.5s,
+  Stitching 4 0.24→23s). Reverted as default. Lives on opt.puzzle.
+  split_shells no longer allocates an nT bitmap per component.
+
+  28 files, 180s timeout. Outputs in each folder/pycork_repair/
+  Watertight solid: NM 29 only.
+  Almost: NM 23 open=0 nm=1; NM 24 nm=0 open=26; NM 13 nm=0 open=279
+  NM 28_danger_1 still worse (nm 2→734, open 2→1513)
+  Stitching leftover opens; 11 deadly nm 138→98970, 278 shells
+  Impossible: 27/27_merged/16/17/21/26 finished. 29/19/1 TIMEOUT.
+    21 took 54s and got worse (nm 387→1629).
+  Skip next loop: NM 20/26/27/28_danger; Imp 29/19/1/G40601/MFUE
+
+  Next integration that can move quality: real intersecting-face
+  cork (not AABB si_subset) after split. Do not default until
+  slc 21 still ~1s / same V F vol.
+
+----------------------------------------------------------------
+NM ALL 17  (no skips, timeout 300s)
+  Table: E:\github.com\pycork\nm_all_results.txt
+  JSON:  E:\github.com\pycork\nm_all_results.json
+  STLs:  Non Manifold/pycork_repair/
+  15 finished, 2 TIMEOUT: 20.stl (16 MB valence-52), 26.stl (146 MB)
+  28_danger.stl 9.3s and 27.stl 5.9s DID finish (were skipped before)
+  watertight solid: 29 only
+  28_danger_1 still worse (nm 2->734 open 2->1513)
+

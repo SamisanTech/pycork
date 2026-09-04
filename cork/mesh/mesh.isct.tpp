@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 #include <array>
+#include <stdexcept>
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
@@ -1694,7 +1695,7 @@ void Mesh<VertData,TriData>::IsctProblem::findIntersections()
     }
     if(nTrys <= 0) {
         CORK_ERROR("Ran out of tries to perturb the mesh");
-        exit(1);
+        throw std::runtime_error("cork: ran out of tries to perturb the mesh");
     }
     
     // ok all points put together,

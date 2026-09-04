@@ -1,4 +1,4 @@
-"""Simple pycork.resolveIntersection + Open3D preview of result only."""
+"""Run pycork.repair (one integrated pass) and write a single STL."""
 from __future__ import annotations
 
 import argparse
@@ -44,60 +44,53 @@ def main():
         raise SystemExit("pycork needs numpy<2")
 
     path = Path(args.stl)
+    out_path = path.with_name(path.stem + "_repair.stl")
     print(f"Loading {path}")
+    print(f"pycork {pycork.__file__}")
+
+    t0 = time.perf_counter()
     verts, faces = pycork.readSTL(str(path))
+    io_in = time.perf_counter() - t0
     verts = np.ascontiguousarray(verts, dtype=np.float64)
     faces = np.ascontiguousarray(faces, dtype=np.uint64)
     o0, n0, h0 = edge_stats(faces)
     print(f"INPUT  V={len(verts):,} F={len(faces):,} open={o0} nm={n0} hist={h0}")
+    print(f"IO in  {io_in:.3f}s")
 
-    # cork has no separate outerHull API — resolveIntersections only remeshes at SI
-    print("pycork.resolveIntersection ...")
-    t0 = time.time()
-    vout, fout = pycork.resolveIntersection(verts, faces)
-    dt = time.time() - t0
-    print(f"done in {dt:.2f}s")
+    print("pycork.repair (resolve + our hull) ...")
+    t0 = time.perf_counter()
+    vout, fout, rstats = pycork.repair(verts, faces)
+    dt = time.perf_counter() - t0
+    print(f"repair {dt:.3f}s  {rstats}")
 
-    out = trimesh.Trimesh(vertices=vout, faces=fout, process=False)
+    mesh = trimesh.Trimesh(vertices=vout, faces=fout, process=False)
     o1, n1, h1 = edge_stats(fout)
+    comps = trimesh.graph.connected_components(mesh.face_adjacency, nodes=np.arange(len(fout)))
     print(
-        f"OUT    V={len(out.vertices):,} F={len(out.faces):,} open={o1} nm={n1} hist={h1} "
-        f"solid={pycork.isSolid(np.ascontiguousarray(out.vertices, dtype=np.float64), np.ascontiguousarray(out.faces, dtype=np.uint64))}"
+        f"OUT    V={len(mesh.vertices):,} F={len(mesh.faces):,} open={o1} nm={n1} hist={h1} "
+        f"shells={len(comps)} watertight={mesh.is_watertight} winding_ok={mesh.is_winding_consistent} "
+        f"volume={mesh.volume:.6f} "
+        f"solid={pycork.isSolid(np.ascontiguousarray(mesh.vertices, dtype=np.float64), np.ascontiguousarray(mesh.faces, dtype=np.uint64))}"
     )
 
-    out_path = path.with_name(path.stem + "_resolve.stl")
-    pycork.writeSTL(str(out_path), np.ascontiguousarray(vout, dtype=np.float64),
-                    np.ascontiguousarray(fout, dtype=np.uint64))
+    t0 = time.perf_counter()
+    pycork.writeSTL(
+        str(out_path),
+        np.ascontiguousarray(vout, dtype=np.float64),
+        np.ascontiguousarray(fout, dtype=np.uint64),
+    )
+    io_out = time.perf_counter() - t0
     print(f"Wrote {out_path}")
-
-    # combined: resolve + outer hull (winding-number classification)
-    print("pycork.outerHull (resolve + hull) ...")
-    t0 = time.time()
-    hv, hf, hstats = pycork.outerHull(verts, faces)
-    dth = time.time() - t0
-    print(f"done in {dth:.2f}s  stats={hstats}")
-    hull = trimesh.Trimesh(vertices=hv, faces=hf, process=False)
-    o2, n2, h2 = edge_stats(hf)
-    comps = trimesh.graph.connected_components(hull.face_adjacency, nodes=np.arange(len(hf)))
-    print(
-        f"HULL   V={len(hull.vertices):,} F={len(hull.faces):,} open={o2} nm={n2} hist={h2} "
-        f"shells={len(comps)} watertight={hull.is_watertight} winding_ok={hull.is_winding_consistent} "
-        f"volume={hull.volume:.6f} (resolved volume={out.volume:.6f}) "
-        f"solid={pycork.isSolid(np.ascontiguousarray(hull.vertices, dtype=np.float64), np.ascontiguousarray(hull.faces, dtype=np.uint64))}"
-    )
-    hull_path = path.with_name(path.stem + "_hull.stl")
-    pycork.writeSTL(str(hull_path), np.ascontiguousarray(hv, dtype=np.float64),
-                    np.ascontiguousarray(hf, dtype=np.uint64))
-    print(f"Wrote {hull_path}")
+    print(f"IO out {io_out:.3f}s  IO+repair {io_in + dt:.3f}s")
 
     if args.no_preview:
         return
 
-    title = f"pycork outerHull (resolve {dt:.2f}s, resolve+hull {dth:.2f}s)"
+    title = f"pycork repair {dt:.2f}s"
     print(f"Open3D preview: {title}")
     o3 = o3d.geometry.TriangleMesh()
-    o3.vertices = o3d.utility.Vector3dVector(np.asarray(hull.vertices, dtype=np.float64))
-    o3.triangles = o3d.utility.Vector3iVector(np.asarray(hull.faces, dtype=np.int32))
+    o3.vertices = o3d.utility.Vector3dVector(np.asarray(mesh.vertices, dtype=np.float64))
+    o3.triangles = o3d.utility.Vector3iVector(np.asarray(mesh.faces, dtype=np.int32))
     o3.compute_vertex_normals()
     o3d.visualization.draw_geometries([o3], window_name=title)
 

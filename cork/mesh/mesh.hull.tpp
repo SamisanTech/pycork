@@ -41,6 +41,7 @@ namespace cork_hull {
 struct HullStats {
     size_t patches = 0, split_patches = 0, seeds = 0, kept = 0, flipped = 0,
            deleted = 0, rays = 0, unresolved = 0, pruned = 0;
+    bool closed = true; // no open/NM boundary left after prune
 };
 
 // splitmix64 -- deterministic per (patch, sample) random stream
@@ -81,7 +82,8 @@ enum : int8_t { HULL_UNSET = -1, HULL_KEEP = 0, HULL_FLIP = 1, HULL_DELETE = 2 }
 } // namespace cork_hull
 
 template<class VertData, class TriData>
-void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *stats)
+void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *stats,
+                                       double leftoverAreaFrac)
 {
     using namespace cork_si;
     using namespace cork_hull;
@@ -494,14 +496,14 @@ void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *s
     }
 
     // ------------------------------------------------------------------
-    // 3b. prune slivers: after classification the hull can still carry a
-    //     few tiny patches (a handful of faces, ~1e-5 area) that live
-    //     between nearly coincident sheets; they attach to the rest only
-    //     through non-manifold or open edges.  Drop small kept components
-    //     whose boundary is not manifold.  Closed small components (a
-    //     legitimate separate shell) have no such boundary and survive.
+    // 3b. prune leftover scraps on the fly (no second mesh walk).
+    //     - slivers: small kept comps (<100 faces) with a non-manifold /
+    //       open boundary (between coincident sheets)
+    //     - Mira leftover shells: any kept component whose area is
+    //       < 0.001 * largest component, including closed junk
     // ------------------------------------------------------------------
     size_t nPruned = 0;
+    bool hullClosed = true;
     {
         CORK_PROF("  hull: prune slivers");
         const size_t SMALL = 100;
@@ -546,18 +548,33 @@ void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *s
             }
             std::vector<uint32_t> compSize(nk, 0);
             std::vector<uint8_t>  compBoundary(nk, 0);
+            std::vector<double>   compArea(nk, 0);
             std::vector<uint32_t> root(nk);
             for (size_t j = 0; j < nk; ++j) {
                 root[j] = find((uint32_t)j);
                 compSize[root[j]]++;
                 compBoundary[root[j]] |= hasBoundary[j];
+                const Tri &t = tris[kept[j]];
+                compArea[root[j]] += 0.5 * len(cross(verts[t.a].pos - verts[t.b].pos,
+                                                     verts[t.c].pos - verts[t.b].pos));
             }
+            double maxA = 0;
+            for (size_t j = 0; j < nk; ++j)
+                if (compArea[j] > maxA) maxA = compArea[j];
+            const double areaCut = leftoverAreaFrac > 0 ? leftoverAreaFrac * maxA : -1;
             size_t removed = 0;
             for (size_t j = 0; j < nk; ++j) {
                 uint32_t r = root[j];
-                if (compBoundary[r] && compSize[r] < SMALL) { faceCode[kept[j]] = HULL_DELETE; ++removed; }
+                const bool sliver = compBoundary[r] && compSize[r] < SMALL;
+                const bool leftover = leftoverAreaFrac > 0 && compArea[r] < areaCut;
+                if (sliver || leftover) { faceCode[kept[j]] = HULL_DELETE; ++removed; }
             }
             nPruned += removed;
+            hullClosed = true;
+            for (size_t j = 0; j < nk; ++j) {
+                if (faceCode[kept[j]] == HULL_DELETE) continue;
+                if (compBoundary[root[j]]) { hullClosed = false; break; }
+            }
             if (removed == 0) break;
         }
         cork_prof::note("  hull: sliver faces pruned", (double)nPruned);
@@ -607,6 +624,7 @@ void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *s
             stats->patches = np; stats->split_patches = nSplit; stats->seeds = nSeeds;
             stats->kept = kept; stats->flipped = flipped; stats->deleted = nt - nt2;
             stats->rays = nRays; stats->unresolved = nUnresolved; stats->pruned = nPruned;
+            stats->closed = hullClosed;
         }
         cork_prof::note("  hull: faces kept", (double)kept);
         cork_prof::note("  hull: faces flipped", (double)flipped);

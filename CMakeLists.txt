@@ -188,6 +188,12 @@ link_directories(
 
 set(APP_H_SRCS
     cork/cork.h
+    cork/core/surface.h
+    cork/io/stl.h
+    cork/repair/options.h
+    cork/repair/ops.h
+    cork/repair/cluster.h
+    cork/repair/pipeline.h
     cork/accel/aabvh.h
     cork/file_formats/files.h
     cork/isct/absext4.h

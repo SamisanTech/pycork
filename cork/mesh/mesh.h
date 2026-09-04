@@ -259,7 +259,8 @@ public: // ISCT (intersections) module
 public: // OUTER HULL module (single mesh; call after resolveIntersections)
     // keeps only faces whose one side has generalized winding number 0,
     // flipping faces whose *back* side is exterior.  See mesh.hull.tpp.
-    void outerHull(int raysPerPatch = 5, cork_hull::HullStats *stats = nullptr);
+    void outerHull(int raysPerPatch = 5, cork_hull::HullStats *stats = nullptr,
+                   double leftoverAreaFrac = 0.001);
 
 public: // BOOLean operation module
     // all of the form

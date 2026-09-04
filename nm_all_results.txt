@@ -1,0 +1,28 @@
+Non Manifold repair — default pycork.repair (resolve + our hull + leftover fill)
+2026-09-05  timeout 300s
+STLs: .../Non Manifold/pycork_repair/{stem}_repair.stl
+JSON: E:\github.com\pycork\nm_all_results.json
+
+file              s      in_F -> out_F         nm in->out     open in->out   shells  wt     vol
+29.stl            0.009      8,510 -> 8,192           9 -> 0          0 -> 0      1   YES    21.906
+21.stl            0.952     73,054 -> 108,497      2414 -> 689       0 -> 553    6   no     10.451
+6.stl             0.236     80,541 -> 100,803      1285 -> 40        5 -> 207    1   no    231.043
+25.stl            2.814     90,902 -> 98,405       3152 -> 282       0 -> 84     2   no    233.651
+13.stl            0.174     94,776 -> 100,837       268 -> 0         0 -> 279    1   no     68.031
+24.stl            0.261    147,652 -> 119,302       712 -> 0         0 -> 26     1   no    537.300
+12.stl            1.896    251,186 -> 220,789     47887 -> 878       0 -> 758    1   no    536.259
+23.stl            0.447    303,137 -> 279,326      1029 -> 1         0 -> 0      1   no   1075.127
+20.stl          TIMEOUT 16.4 MB  (valence-52 pile; still in resolve at 300s)
+2.stl             3.043    544,578 -> 812,632       973 -> 115       0 -> 0      1   no    120.608
+22.stl            3.404    570,722 -> 826,816     12074 -> 402       0 -> 823    1   no    465.618
+5.stl             2.022    579,424 -> 739,108      1418 -> 17        0 -> 178    1   no   1536.729
+18.stl            2.098    724,789 -> 761,742      2135 -> 1234     23 -> 1005   1   no    381.165
+28_danger_1.stl   2.685  1,000,584 -> 771,973         2 -> 734       2 -> 1513   1   no    986.167  WORSE
+26.stl          TIMEOUT 146 MB  (still in resolve at 300s)
+28_danger.stl     9.342  2,941,266 -> 2,963,608   13856 -> 1735      2 -> 996   12   no   6600.842
+27.stl            5.919  3,191,143 -> 3,080,614     234 -> 276     573 -> 242   15   no   1691.467
+
+17 files: 15 finished, 2 timeout (20, 26)
+Watertight solid: 29 only
+Almost: 23 (open=0 nm=1), 24 (nm=0 open=26), 13 (nm=0 open=279), 2 (open=0 nm=115)
+New vs prior skip list: 28_danger and 27 completed; 20 and 26 still hang
