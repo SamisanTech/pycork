@@ -136,7 +136,7 @@ void eigenToCorkMesh(const Eigen::Matrix<double, Eigen::Dynamic, 3> &verts,
         raw.vertices[i].pos.z = verts(i, 2);
     });
 
-    *mesh = CorkMesh(raw);
+    *mesh = CorkMesh(std::move(raw));
 
 }
 

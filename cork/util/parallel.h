@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -97,6 +99,168 @@ inline void build_csr(size_t n, size_t m, KeyF key,
     order.resize(m);
     std::vector<unsigned> cur(offsets.begin(), offsets.end() - 1);
     for (size_t i = 0; i < m; ++i) order[cur[key(i)]++] = (unsigned)i;
+}
+
+// Inclusive prefix of p[0..n): p[i] += p[i-1].  Blocked parallel for large n.
+inline void prefix_sum_inplace(uint32_t *p, size_t n)
+{
+    if (n <= 1) return;
+    if (n < 1 << 16) {
+        for (size_t i = 1; i < n; ++i) p[i] += p[i - 1];
+        return;
+    }
+    const size_t grain = 4096;
+    const size_t nblk = (n + grain - 1) / grain;
+    std::vector<uint32_t> blk(nblk);
+    for_range(nblk, 1, [&](size_t b0, size_t b1) {
+        for (size_t b = b0; b < b1; ++b) {
+            size_t s = b * grain, e = std::min(n, s + grain);
+            uint32_t acc = 0;
+            for (size_t i = s; i < e; ++i) { acc += p[i]; p[i] = acc; }
+            blk[b] = acc;
+        }
+    });
+    for (size_t b = 1; b < nblk; ++b) blk[b] += blk[b - 1];
+    for_range(nblk, 1, [&](size_t b0, size_t b1) {
+        for (size_t b = b0; b < b1; ++b) {
+            if (b == 0) continue;
+            uint32_t add = blk[b - 1];
+            size_t s = b * grain, e = std::min(n, s + grain);
+            for (size_t i = s; i < e; ++i) p[i] += add;
+        }
+    });
+}
+
+// Stable LSD radix sort of n uint64 keys.  8-bit digits, ping-pong buffers.
+inline void radix_sort_u64(uint64_t *a, size_t n)
+{
+    if (n < 2) return;
+    if (n < 4096) { std::sort(a, a + n); return; }
+    std::vector<uint64_t> tmp(n);
+    uint64_t *src = a, *dst = tmp.data();
+    const int BUCKETS = 256;
+#if defined(CORK_USE_TBB)
+    const size_t grain = 1 << 16;
+    const size_t nblk = (n + grain - 1) / grain;
+    std::vector<uint32_t> hist((size_t)nblk * BUCKETS);
+    for (int pass = 0; pass < 8; ++pass) {
+        const int shift = pass * 8;
+        std::fill(hist.begin(), hist.end(), 0u);
+        for_range(nblk, 1, [&](size_t b0, size_t b1) {
+            for (size_t b = b0; b < b1; ++b) {
+                size_t s = b * grain, e = std::min(n, s + grain);
+                uint32_t *h = &hist[b * BUCKETS];
+                for (size_t i = s; i < e; ++i)
+                    h[(src[i] >> shift) & 0xffu]++;
+            }
+        });
+        // exclusive prefix across (block, bucket) in bucket-major order
+        uint32_t acc = 0;
+        uint32_t off[BUCKETS];
+        for (int k = 0; k < BUCKETS; ++k) {
+            off[k] = acc;
+            for (size_t b = 0; b < nblk; ++b) {
+                uint32_t c = hist[b * BUCKETS + k];
+                hist[b * BUCKETS + k] = acc;
+                acc += c;
+            }
+        }
+        (void)off;
+        for_range(nblk, 1, [&](size_t b0, size_t b1) {
+            for (size_t b = b0; b < b1; ++b) {
+                size_t s = b * grain, e = std::min(n, s + grain);
+                uint32_t *h = &hist[b * BUCKETS];
+                for (size_t i = s; i < e; ++i) {
+                    uint32_t d = (uint32_t)((src[i] >> shift) & 0xffu);
+                    dst[h[d]++] = src[i];
+                }
+            }
+        });
+        std::swap(src, dst);
+    }
+    if (src != a) std::memcpy(a, src, n * sizeof(uint64_t));
+#else
+    uint32_t hist[BUCKETS];
+    for (int pass = 0; pass < 8; ++pass) {
+        const int shift = pass * 8;
+        std::memset(hist, 0, sizeof(hist));
+        for (size_t i = 0; i < n; ++i) hist[(src[i] >> shift) & 0xffu]++;
+        uint32_t sum = 0;
+        for (int k = 0; k < BUCKETS; ++k) { uint32_t c = hist[k]; hist[k] = sum; sum += c; }
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t d = (uint32_t)((src[i] >> shift) & 0xffu);
+            dst[hist[d]++] = src[i];
+        }
+        std::swap(src, dst);
+    }
+    if (src != a) std::memcpy(a, src, n * sizeof(uint64_t));
+#endif
+}
+
+// Stable LSD radix sort of records by a uint64 key extractor.
+template<class T, class KeyFn>
+inline void radix_sort_by_key(T *a, size_t n, KeyFn keyfn)
+{
+    if (n < 2) return;
+    if (n < 4096) {
+        std::sort(a, a + n, [&](const T &x, const T &y) { return keyfn(x) < keyfn(y); });
+        return;
+    }
+    std::vector<T> tmp(n);
+    T *src = a, *dst = tmp.data();
+    const int BUCKETS = 256;
+#if defined(CORK_USE_TBB)
+    const size_t grain = 1 << 15;
+    const size_t nblk = (n + grain - 1) / grain;
+    std::vector<uint32_t> hist((size_t)nblk * BUCKETS);
+    for (int pass = 0; pass < 8; ++pass) {
+        const int shift = pass * 8;
+        std::fill(hist.begin(), hist.end(), 0u);
+        for_range(nblk, 1, [&](size_t b0, size_t b1) {
+            for (size_t b = b0; b < b1; ++b) {
+                size_t s = b * grain, e = std::min(n, s + grain);
+                uint32_t *h = &hist[b * BUCKETS];
+                for (size_t i = s; i < e; ++i)
+                    h[(keyfn(src[i]) >> shift) & 0xffu]++;
+            }
+        });
+        uint32_t acc = 0;
+        for (int k = 0; k < BUCKETS; ++k) {
+            for (size_t b = 0; b < nblk; ++b) {
+                uint32_t c = hist[b * BUCKETS + k];
+                hist[b * BUCKETS + k] = acc;
+                acc += c;
+            }
+        }
+        for_range(nblk, 1, [&](size_t b0, size_t b1) {
+            for (size_t b = b0; b < b1; ++b) {
+                size_t s = b * grain, e = std::min(n, s + grain);
+                uint32_t *h = &hist[b * BUCKETS];
+                for (size_t i = s; i < e; ++i) {
+                    uint32_t d = (uint32_t)((keyfn(src[i]) >> shift) & 0xffu);
+                    dst[h[d]++] = src[i];
+                }
+            }
+        });
+        std::swap(src, dst);
+    }
+    if (src != a) std::memcpy(a, src, n * sizeof(T));
+#else
+    uint32_t hist[BUCKETS];
+    for (int pass = 0; pass < 8; ++pass) {
+        const int shift = pass * 8;
+        std::memset(hist, 0, sizeof(hist));
+        for (size_t i = 0; i < n; ++i) hist[(keyfn(src[i]) >> shift) & 0xffu]++;
+        uint32_t sum = 0;
+        for (int k = 0; k < BUCKETS; ++k) { uint32_t c = hist[k]; hist[k] = sum; sum += c; }
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t d = (uint32_t)((keyfn(src[i]) >> shift) & 0xffu);
+            dst[hist[d]++] = src[i];
+        }
+        std::swap(src, dst);
+    }
+    if (src != a) std::memcpy(a, src, n * sizeof(T));
+#endif
 }
 
 } // namespace cork_par

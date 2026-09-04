@@ -45,6 +45,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <utility>
 #include <vector>
 #include <set>
 #include <sstream>
@@ -190,6 +191,7 @@ public:
     Mesh();
     Mesh(Mesh &&src);
     Mesh(const RawMesh<VertData,TriData> &raw);
+    Mesh(RawMesh<VertData,TriData> &&raw);
     virtual ~Mesh();
 
     void operator=(Mesh &&src);
@@ -446,13 +448,25 @@ template<class VertData, class TriData>
 Mesh<VertData,TriData>::Mesh(const RawMesh<VertData,TriData> &raw) :
         tris(raw.triangles.size()), verts(raw.vertices)
 {
-    // fill out the triangles
-    for(uint i=0; i<raw.triangles.size(); i++) {
+    const size_t nt = raw.triangles.size();
+    cork_par::for_each_idx(nt, 8192, [&](size_t i) {
         tris[i].data = raw.triangles[i];
         tris[i].a = raw.triangles[i].a;
         tris[i].b = raw.triangles[i].b;
         tris[i].c = raw.triangles[i].c;
-    }
+    });
+}
+template<class VertData, class TriData>
+Mesh<VertData,TriData>::Mesh(RawMesh<VertData,TriData> &&raw) :
+        tris(raw.triangles.size()), verts(std::move(raw.vertices))
+{
+    const size_t nt = raw.triangles.size();
+    cork_par::for_each_idx(nt, 8192, [&](size_t i) {
+        tris[i].data = raw.triangles[i];
+        tris[i].a = raw.triangles[i].a;
+        tris[i].b = raw.triangles[i].b;
+        tris[i].c = raw.triangles[i].c;
+    });
 }
 template<class VertData, class TriData>
 Mesh<VertData,TriData>::~Mesh()
@@ -743,9 +757,10 @@ struct Mesh<VertData, TriData>::TopoCache {
 
     Mesh *mesh;
     TopoCache(Mesh *owner);
-    // vertEdges=false skips the vertex->edge incidence lists (clients that
-    // never read TopoVert::edges, e.g. IsctProblem)
+    // vertEdges=false skips vertex->edge lists; vertTris=false skips
+    // vertex->triangle lists (IsctProblem never reads either after init).
     TopoCache(Mesh *owner, bool vertEdges);
+    TopoCache(Mesh *owner, bool vertEdges, bool vertTris);
     virtual ~TopoCache() {}
 
     // until commit() is called, the Mesh::verts and Mesh::tris
@@ -771,8 +786,13 @@ struct Mesh<VertData, TriData>::TopoCache {
     // helper to flip triangle orientation
     inline void flipTri(Tptr);
 
+    // Contiguous first-wave allocations (valid until individual free()).
+    IterPool<TopoVert>::Bulk vbulk;
+    IterPool<TopoEdge>::Bulk ebulk;
+    IterPool<TopoTri>::Bulk  tbulk;
+
 private:
-    void init(bool vertEdges = true);
+    void init(bool vertEdges = true, bool vertTris = true);
 };
 
 
@@ -873,7 +893,12 @@ Mesh<VertData, TriData>::TopoCache::TopoCache(Mesh *owner) : mesh(owner)
 template<class VertData, class TriData>
 Mesh<VertData, TriData>::TopoCache::TopoCache(Mesh *owner, bool vertEdges) : mesh(owner)
 {
-    init(vertEdges);
+    init(vertEdges, true);
+}
+template<class VertData, class TriData>
+Mesh<VertData, TriData>::TopoCache::TopoCache(Mesh *owner, bool vertEdges, bool vertTris) : mesh(owner)
+{
+    init(vertEdges, vertTris);
 }
 
 
@@ -906,14 +931,15 @@ inline TopoEdgePrototype& getTopoEdgePrototype(uint a, uint b,
 // (same verts[0]/verts[1] ordering, same tri->edges[k] correspondence, same
 //  ascending-triangle order in incidence lists).
 template<class VertData, class TriData>
-void Mesh<VertData, TriData>::TopoCache::init(bool vertEdges)
+void Mesh<VertData, TriData>::TopoCache::init(bool vertEdges, bool vertTris)
 {
     CORK_PROF("    TopoCache::init");
     const size_t nv = mesh->verts.size();
     const size_t nt = mesh->tris.size();
 
     // ---- vertices ----
-    auto vb = verts.alloc_bulk((uint)nv);
+    vbulk = verts.alloc_bulk((uint)nv);
+    auto vb = vbulk;
     cork_par::for_each_idx(nv, 8192, [&](size_t i) {
         Vptr v  = vb[i];
         v->ref  = (uint)i;
@@ -921,7 +947,8 @@ void Mesh<VertData, TriData>::TopoCache::init(bool vertEdges)
     });
 
     // ---- triangles ----
-    auto tb = tris.alloc_bulk((uint)nt);
+    tbulk = tris.alloc_bulk((uint)nt);
+    auto tb = tbulk;
     cork_par::for_each_idx(nt, 8192, [&](size_t i) {
         Tptr t  = tb[i];
         t->ref  = (uint)i;
@@ -930,8 +957,8 @@ void Mesh<VertData, TriData>::TopoCache::init(bool vertEdges)
         for(uint k=0; k<3; k++) t->verts[k] = vb[rt.v[k]];
     });
 
-    // ---- vertex -> triangle ----
-    {
+    // ---- vertex -> triangle (skipped by IsctProblem: never read) ----
+    if (vertTris) {
         std::vector<unsigned> off, ord;
         cork_par::build_csr(nv, 3*nt,
             [&](size_t c) { return (size_t)mesh->tris[c/3].v[c%3]; }, off, ord);
@@ -969,7 +996,8 @@ void Mesh<VertData, TriData>::TopoCache::init(bool vertEdges)
     runStart.push_back((uint32_t)ek.size());
     const size_t ne = runStart.size() - 1;
 
-    auto eb = edges.alloc_bulk((uint)ne);
+    ebulk = edges.alloc_bulk((uint)ne);
+    auto eb = ebulk;
     cork_par::for_each_idx(ne, 4096, [&](size_t r) {
         Eptr e   = eb[r];
         e->data  = nullptr;
@@ -1030,11 +1058,14 @@ void Mesh<VertData, TriData>::TopoCache::commit()
 
     // compact the vertices and build a remapping function
     std::vector<uint> vmap(NV);
-    uint write = 0;
-    for(size_t read = 0; read < NV; read++) {
-        if(live_verts[read]) vmap[read] = write++;
-        else                 vmap[read] = INVALID_ID;
-    }
+    std::vector<uint32_t> vps(NV);
+    cork_par::for_each_idx(NV, 8192, [&](size_t i) { vps[i] = live_verts[i]; });
+    cork_par::prefix_sum_inplace(vps.data(), NV);
+    uint write = NV ? vps[NV - 1] : 0;
+    cork_par::for_each_idx(NV, 8192, [&](size_t read) {
+        if (live_verts[read]) vmap[read] = vps[read] - 1;
+        else                  vmap[read] = INVALID_ID;
+    });
     {
         std::vector<VertData> nverts(write);
         cork_par::for_each_idx(NV, 8192, [&](size_t read) {
@@ -1049,11 +1080,14 @@ void Mesh<VertData, TriData>::TopoCache::commit()
     });
 
     std::vector<uint> tmap(NT);
-    write = 0;
-    for(size_t read = 0; read < NT; read++) {
-        if(live_tris[read]) tmap[read] = write++;
-        else                tmap[read] = INVALID_ID;
-    }
+    std::vector<uint32_t> tps(NT);
+    cork_par::for_each_idx(NT, 8192, [&](size_t i) { tps[i] = live_tris[i]; });
+    cork_par::prefix_sum_inplace(tps.data(), NT);
+    write = NT ? tps[NT - 1] : 0;
+    cork_par::for_each_idx(NT, 8192, [&](size_t read) {
+        if (live_tris[read]) tmap[read] = tps[read] - 1;
+        else                 tmap[read] = INVALID_ID;
+    });
     {
         std::vector<Tri> ntris(write);
         cork_par::for_each_idx(NT, 8192, [&](size_t read) {

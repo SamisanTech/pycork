@@ -591,24 +591,31 @@ template<class VertData, class TriData>
 class Mesh<VertData,TriData>::IsctProblem : public TopoCache
 {
 public:
-    IsctProblem(Mesh *owner) : TopoCache(owner, /*vertEdges=*/false)
+    IsctProblem(Mesh *owner) : TopoCache(owner, /*vertEdges=*/false, /*vertTris=*/false)
     {
         // (TopoCache::init already leaves every t->data == nullptr)
         
         // Callibrate the quantization unit...
         double maxMag = 0.0;
-        for(VertData &v : TopoCache::mesh->verts) {
-            maxMag = std::max(maxMag, max(abs(v.pos)));
+        {
+            cork_par::Local<double> acc([] { return 0.0; });
+            const auto &vs = TopoCache::mesh->verts;
+            cork_par::for_range(vs.size(), 8192, [&](size_t b, size_t e) {
+                double m = 0.0;
+                for (size_t i = b; i < e; ++i) m = std::max(m, max(abs(vs[i].pos)));
+                acc.local() = std::max(acc.local(), m);
+            });
+            acc.combine_each([&](double m) { maxMag = std::max(maxMag, m); });
         }
         quantization::calibrate(maxMag);
         
         // and use vertex auxiliary data to store quantized vertex coordinates
-        std::vector<Vptr> vv;
-        TopoCache::verts.collect(vv);
-        quantized_coords.resize(vv.size());
+        const size_t nv = (size_t)TopoCache::vbulk.n;
+        quantized_coords.resize(nv);
         Mesh *m = TopoCache::mesh;
-        cork_par::for_each_idx(vv.size(), 8192, [&](size_t i) {
-            Vptr v = vv[i];
+        auto vb = TopoCache::vbulk;
+        cork_par::for_each_idx(nv, 8192, [&](size_t i) {
+            Vptr v = vb[i];
             Vec3d raw = m->verts[v->ref].pos;
             quantized_coords[i].x = quantization::quantize(raw.x);
             quantized_coords[i].y = quantization::quantize(raw.y);
@@ -618,8 +625,9 @@ public:
     }
     
     virtual ~IsctProblem() {
-        // Tear the pools down concurrently (each pool touches only its own
-        // memory; ShortVec storage is inline / per-object heap).
+        // IsctProblem never filled vert incidence lists (inline-empty ShortVecs)
+        // and never free()'d individual edges, so those pools can drop memory
+        // after a parallel dtor sweep of the original bulk (edges) or none (verts).
         cork_par::invoke(
             [&] { glue_pts.release(); },
             [&] { tprobs.release(); },
@@ -629,9 +637,9 @@ public:
             [&] { oepool.release(); },
             [&] { sepool.release(); },
             [&] { gtpool.release(); },
-            [&] { TopoCache::verts.release(); },
-            [&] { TopoCache::edges.release(); });
-        TopoCache::tris.release();
+            [&] { TopoCache::verts.release_memory(); },
+            [&] { TopoCache::edges.release_bulk(TopoCache::ebulk); },
+            [&] { TopoCache::tris.release_memory(); });
     }
     
     // access auxiliary quantized coordinates
@@ -1004,7 +1012,7 @@ inline void buildEntries(const CellGrid &g, const BoxArray &boxes,
         g.cellOf(boxes[i].maxp, b[0], b[1], b[2]);
         cnt[i + 1] = (uint32_t)((b[0]-a[0]+1) * (b[1]-a[1]+1) * (b[2]-a[2]+1));
     });
-    for (size_t i = 0; i < n; ++i) cnt[i + 1] += cnt[i];
+    cork_par::prefix_sum_inplace(cnt.data(), n + 1);
     out.alloc(cnt[n]);
     cork_par::for_each_idx(n, 4096, [&](size_t i) {
         int a[3], b[3];
@@ -1016,7 +1024,7 @@ inline void buildEntries(const CellGrid &g, const BoxArray &boxes,
                 for (int x = a[0]; x <= b[0]; ++x)
                     out[w++] = ((uint64_t)g.key(x, y, z) << 32) | (uint64_t)i;
     });
-    cork_par::sort(out.begin(), out.end());
+    cork_par::sort(out.begin(), out.end()); // tbb parallel_sort; 16-byte-key radix was slower here
 }
 
 // chunk the sorted tri entries without splitting a cell run
@@ -1125,8 +1133,14 @@ bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
     std::vector<Tptr> tris;
     {
         CORK_PROF("      collect edges/tris");
-        TopoCache::edges.collect(edges);
-        TopoCache::tris.collect(tris);
+        edges.resize(TopoCache::ebulk.n);
+        tris.resize(TopoCache::tbulk.n);
+        cork_par::for_each_idx((size_t)TopoCache::ebulk.n, 8192, [&](size_t i) {
+            edges[i] = TopoCache::ebulk[i];
+        });
+        cork_par::for_each_idx((size_t)TopoCache::tbulk.n, 8192, [&](size_t i) {
+            tris[i] = TopoCache::tbulk[i];
+        });
     }
     const size_t ne = edges.size();
     const size_t nt = tris.size();
@@ -1416,12 +1430,25 @@ template<class VertData, class TriData>
 void Mesh<VertData,TriData>::IsctProblem::perturbPositions()
 {
     const double EPSILON = 1.0e-5; // perturbation epsilon
-    for(Vec3d &coord : quantized_coords) {
-        Vec3d perturbation(quantization::quantize(drand(-EPSILON, EPSILON)),
-                           quantization::quantize(drand(-EPSILON, EPSILON)),
-                           quantization::quantize(drand(-EPSILON, EPSILON)));
+    // Per-vertex splitmix: thread-safe, same magnitude as drand(-E,E)^3.
+    // (std::rand is not safe to call from many threads.)
+    const uint64_t seed = (uint64_t)std::rand() ^ 0xA5A5A5A5A5A5A5A5ULL;
+    cork_par::for_each_idx(quantized_coords.size(), 4096, [&](size_t i) {
+        uint64_t x = seed + 0x9e3779b97f4a7c15ULL * (i + 1);
+        auto u01 = [](uint64_t &s) {
+            s += 0x9e3779b97f4a7c15ULL;
+            uint64_t z = s;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            z ^= z >> 31;
+            return (double)(z >> 11) * (1.0 / 9007199254740992.0);
+        };
+        Vec3d &coord = quantized_coords[i];
+        Vec3d perturbation(quantization::quantize((u01(x) * 2.0 - 1.0) * EPSILON),
+                           quantization::quantize((u01(x) * 2.0 - 1.0) * EPSILON),
+                           quantization::quantize((u01(x) * 2.0 - 1.0) * EPSILON));
         coord += perturbation;
-    }
+    });
 }
 
 template<class VertData, class TriData>
@@ -1888,9 +1915,31 @@ void Mesh<VertData,TriData>::IsctProblem::resolveAllIntersections()
     // Along the way, let's go ahead and hook up edges as appropriate
     {
         CORK_PROF("    createRealTriangles");
-        TopoCache::mesh->tris.reserve(TopoCache::mesh->tris.size() + n_new_tris);
-        for(Tprob tprob : probs)
-            createRealTriangles(tprob, ecache);
+        // One bulk allocation + one mesh.tris resize; old triangles are
+        // simply unlinked (commit only cares about live pool objects).
+        const size_t oldN = TopoCache::mesh->tris.size();
+        TopoCache::mesh->tris.resize(oldN + n_new_tris);
+        auto nb = TopoCache::tris.alloc_bulk((uint)n_new_tris);
+        size_t w = 0;
+        for(Tprob tprob : probs) {
+            for(GTptr gt : tprob->gtris) {
+                Tptr t = nb[w];
+                t->ref = (uint)(oldN + w);
+                t->data = nullptr;
+                gt->concrete = t;
+                Tri &tri = TopoCache::mesh->tris[t->ref];
+                for(uint k=0; k<3; k++) {
+                    Vptr v = gt->verts[k]->concrete;
+                    t->verts[k] = v;
+                    t->edges[k] = nullptr;
+                    tri.v[k] = v->ref;
+                }
+                // resolveIntersection does not consume bool_alg_data
+                ++w;
+            }
+            TopoCache::freeTri(tprob->the_tri);
+        }
+        (void)ecache;
         cork_prof::note("    crt: ns newTri+hook", (double)crt_ns[0]);
         cork_prof::note("    crt: ns edges", (double)crt_ns[1]);
         cork_prof::note("    crt: ns fillOutTriData", (double)crt_ns[2]);

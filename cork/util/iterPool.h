@@ -123,6 +123,27 @@ public: // bulk allocation support
         pool.release();
     }
 
+    // Free the backing store without walking objects.  Only safe when every
+    // live T is trivially destructible, or the caller already destroyed them.
+    void release_memory() {
+        numAlloced = 0;
+        block_list = nullptr;
+        pool.release();
+    }
+
+    // Parallel destructor over a contiguous alloc_bulk() range, then drop
+    // memory.  The range must still be the entire live set.
+    void release_bulk(Bulk b) {
+        if (b.n) {
+            cork_par::for_each_idx((size_t)b.n, 4096, [&](size_t i) {
+                b[i]->~T();
+            });
+        }
+        numAlloced = 0;
+        block_list = nullptr;
+        pool.release();
+    }
+
 public: // allocation/deallocation support
     T* alloc() {
         Block *new_block = pool.alloc();

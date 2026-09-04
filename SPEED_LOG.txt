@@ -142,3 +142,85 @@ Algorithm:
          area sliver faces (min 1e-19) remain from cork's triangulation; they
          don't break manifoldness. Optional final degenerate-face cull can be
          added if a strict isSolid==True is required.
+
+================================================================================
+PUSH TOWARD 0.1s  (2026-09-04 21:20)
+================================================================================
+Starting point this round: ~0.98 s resolve (profiled 0.96 s python total).
+Target 0.1 s is another 10x.  Remaining critical path was already all
+"must-touch-the-mesh" work, not leftover exact-arithmetic.
+
+[21:20]  Attempt 9 -- what was tried
+
+  WORKED (kept):
+    * Skip vertex->triangle incidence in IsctProblem (never read after init;
+      deleteTri unhook is unused because commit only looks at live pool
+      objects).  Saves the 3.8M-item CSR + 631k ShortVec fills.
+    * Collect edges/tris from the alloc_bulk() base instead of walking the
+      intrusive linked list:  38 ms -> 7 ms
+    * Parallel per-vertex splitmix perturbation (std::rand is not
+      thread-safe):  35 ms -> 0.5 ms
+    * Batch-create all diced triangles with one alloc_bulk + one
+      mesh.tris.resize; just freeTri the old pieces (no edge unhook):
+      createRealTriangles 100 ms -> 27 ms
+    * Pool teardown: verts/tris are trivially empty/POD -> release_memory()
+      without walking; edges get a parallel dtor sweep of the original bulk:
+      ~IsctProblem 62 ms -> 33 ms
+    * Parallel prefix in commit (tiny; commit still ~74 ms, dominated by
+      copying 0.7M verts + 1.6M tris)
+    * Move-construct Mesh from RawMesh so vertices are not copied twice
+
+  DID NOT HELP (reverted):
+    * 8-pass LSD radix sort of 16-byte EKey records and of the (cell,prim)
+      uint64 entries.  8 full scatters of 3.8-5.8M records cost MORE
+      memory traffic than tbb::parallel_sort.  TopoCache 106 -> 133 ms,
+      bin+sort 45 -> 53 ms.  Reverted both.
+
+[21:25]  New times (21.stl, resolveIntersection only)
+         profiled python total     0.72 s
+         clean runs                0.75 .. 1.00 s  (machine noise +-0.1 s)
+         best this session         ~0.75 s   (was 0.98 s,  ~1.3x this round)
+         vs original cork          11.7 s -> 0.75 s  = 15.6x
+
+         phases now (ms, profiled):
+           TopoCache init          99
+           SI join                102   (still 286M cell pairs, 2.6 s CPU)
+           apply hits              72   (serial TriangleProblem graph, 83k hits)
+           commit                  74
+           subdivide prepare       49
+           bin+sort                46
+           eigen->cork             35
+           boxes                   33
+           ~IsctProblem            33
+           createRealTriangles     27
+           triangulate             22
+           stream SoA              20
+           glue verts              16
+           collect                  7
+           perturb                  0.5
+
+[21:25]  Why 0.1 s is not reachable on this algorithm
+         Adding the unavoidable sequential pieces already exceeds 0.1 s:
+           SI 102 + TopoCache 99 + apply 72 + commit 74 + eigen 35
+           + subdivide-prep 49 + bin/sort 46 + boxes 33  =  ~510 ms
+         even if teardown/create/triangulate went to zero.
+         SI alone is 102 ms wall / 2.6 s CPU for 286 million box tests --
+         that IS the whole 0.1 s budget.  Cutting it 10x needs fewer pairs
+         (different spatial index) or a different predicate, not more SIMD
+         around the same 286M tests (already AVX2, 8 boxes/instruction).
+
+         Next architectural jump if we keep pushing:
+           do SI on the raw index mesh (no TopoCache), then build topology
+           only for the ~70k hit triangles.  That could drop TopoCache+collect
+           +part of teardown (~140 ms) but will not get SI or apply-hits
+           under 20 ms without a new intersection algorithm.
+
+Current best resolve: ~0.75 s   (11.7 s orig -> 0.75 s = 15.6x)
+Pieces that paid off across the whole project, ranked:
+  1. local-origin exact filter + FixExt4 coords     (3.0s -> 1.2s era)
+  2. merge-join grid + AVX SoA + vertex-id reject   (SI 1135 -> 102 ms)
+  3. Triangle pools sized to problem                (689 -> 22 ms)
+  4. skip dead EdgeCache / mark-isct-edges          (createReal 244 -> 100)
+  5. batch createRealTriangles + skip vert incidence + bulk collect
+                                                    (1.0s -> 0.75s era)
+  6. parallel perturb / pool teardown / RawArray    (tens of ms each)
