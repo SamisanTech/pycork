@@ -224,3 +224,140 @@ Pieces that paid off across the whole project, ranked:
   5. batch createRealTriangles + skip vert incidence + bulk collect
                                                     (1.0s -> 0.75s era)
   6. parallel perturb / pool teardown / RawArray    (tens of ms each)
+
+================================================================================
+MANIFOLD-STYLE ATTEMPTS  (from clean speed@9d3cc42, 2026-09-04 21:38)
+================================================================================
+Baseline this session (no flags):  resolve 0.75-0.88 s   resolve+hull 1.13-1.18 s
+Same V/F as 9d3cc42 (714,506 / 1,595,632) unless noted.
+
+Each attempt is an env switch in this tree (default = off = baseline).
+
+----- A. Morton LBVH instead of uniform-grid merge-join -----
+  How: Karras 2012 radix tree (same as Manifold Collider). Morton-sort
+       triangle AABBs, parallel build internals, DFS query per edge box.
+       Narrow phase unchanged (vertex-id reject, hasIsct, emptyExact).
+  Env: CORK_LBVH=1
+  Result: resolve 0.93 s  (WORSE, +180 ms)   V/F IDENTICAL to grid
+  Profile: LBVH build 62 ms + query/narrow 230 ms
+           vs grid bin+sort 46 + stream 20 + SI 102 = 168 ms
+  Filter calls 3,581,514 and hits 82,895 -- SAME as grid. So the tree
+  found the same AABB pairs; it is just a slower way to enumerate them
+  on this dense surface. Grid+AVX streams 286M tests through SoA cache
+  lines; LBVH does fewer tests but with random node-box gathers and a
+  64-deep DFS per edge (1.89M queries).
+  Flip (CORK_LBVH_TRI=1): build on edges, query 1.26M tris: 0.92 s, same.
+  Verdict: KEEP GRID. LBVH wins for sparse CAD solids (Manifold's case),
+  not for a 1.3M-triangle almost-2D surface packed in a tight bbox.
+
+----- B. autoPolicy (serial if n <= 10k) -----
+  How: Manifold's autoPolicy -- TBB only above a size threshold.
+  Env: CORK_AUTOPOLICY=1  (wired into cork_par::for_range)
+  Result: resolve 1.77 s   hull 2.32 s  (MUCH WORSE, ~2.3x)
+  Why: 10k threshold serialized hull-ray batches, SI chunks, and other
+  medium loops whose per-item work is large. Manifold's kernels are
+  tiny (write one int); ours are not. Blanket autoPolicy is wrong here.
+  Verdict: REVERT / leave flag off. Only use a threshold on proven-tiny
+  loops (prefix-sum, collect), never globally.
+
+----- C. Flood-fill / cheap hull classify -----
+  How: 1 ray-seed per patch (not ~5-50) + extend topological vote to
+  ALL patches (Manifold classifies by flood from intersection signs).
+  Env: CORK_HULL_FLOOD=1
+  Result: resolve+hull 1.20 s (slightly worse) and DIFFERENT mesh:
+          F 930,993 -> 921,576  (lost ~9k faces)
+  Why: one seed is not enough where a cork intersection curve is gapped
+  and two regions share a patch. Topo vote on large patches then
+  over-deletes. Manifold's flood works because Boolean3 already has a
+  consistent signed intersection graph on two manifold operands; we don't.
+  Verdict: DO NOT KEEP. Quality regression.
+
+----- D. Index-SI / overlap TopoCache with SI -----
+  Not shipped as a flag: doing it honestly means either
+    (1) duplicate the 3.8M edge-key sort on both sides of parallel_invoke
+        (CPU contention, ~2x sort), or
+    (2) split TopoCache::init after the shared sort, then
+        invoke(fill-edges, boxes+SI).
+  Estimate for (2): save ~50-80 ms (init's post-sort ~50 ms hidden
+  under SI's 170 ms). Critical path becomes
+      sort 50 + SI 170 + apply 70 + rest  ~ 0.65 s best case,
+  still nowhere near 0.1 s. Full "no TopoCache until after SI" still
+  pays init before apply-hits (apply needs Eptr->tris).
+  Verdict: real but small; not worth the dual-sort / init split this pass.
+
+----- Combined LBVH+flood -----
+  resolve 0.93 s, hull 1.32 s, F=921,576 (LBVH slowness + flood error)
+
+Scoreboard vs baseline 0.75 s / 1.13 s:
+  LBVH           -0.18 s  (slower)  same result
+  LBVH tri-query -0.16 s  (slower)  same result
+  autoPolicy     -1.02 s  (slower)  same result
+  flood hull     ~0 / worse quality
+  overlap topo   not built; est. +0.05-0.08 s if split after sort
+
+Nothing from this Manifold list beat the grid+AVX path on 21.stl.
+Their wins assume manifold CAD parts + cheap predicates + LBVH over
+sparse boxes. Our bottleneck is 3.6M exact edge-tri tests on a dense
+quantized soup, which the merge-join already feeds efficiently.
+
+================================================================
+30.stl -- same pipeline (our code, then flags). 2026-09-04
+FILE E:\github.com\SamisanTech\slc_stl\tests\data\30.stl
+INPUT after merge_vertices: V=4,897,739 F=9,805,834  (~8x 21.stl)
+  open=0  nm=16,058
+  hist={2: 14,676,372, 3: 957, 4: 14,595, 5: 11, 6: 293, 8: 164, 9: 2, 10: 34, 12: 2}
+  bbox [-45.51, -9.74, -45.31] .. [0.057, 9.74, 49.56]
+  extents 45.56 x 19.48 x 94.87
+
+ALL resolve paths die in Shewchuk Triangle CDT (triexit) during
+"subdivide: triangulate (par)" after SI succeeds. Hull / CORK_HULL_FLOOD
+never run. Errors seen (nondeterministic which polygon, cork perturbs):
+  insertsegment: Unable to locate PSLG vertex
+  finddirection: Unable to find a triangle leading from A to B
+  segmentintersection: Topological inconsistency after splitting a segment
+  (one LBVH run also printed out.numberofpoints 13 vs in 12)
+
+SI itself is consistent across flags:
+  #edge-tri hits = 1,313,129   #tprobs = 851,402   #filter calls = 58,249,219
+
+----- OUR CODE (no flags) -----
+  TopoCache init          1037 ms
+  grid 333 x 143 x 692
+  #cell cross pairs   4,731,113,512   (~13x 21.stl's pair storm)
+  #float-box cands      374,022,965
+  exact fallbacks               4
+  coords CPU (sum)           8163 ms
+  SI busy CPU (sum)         68030 ms
+  parallel edge-tri SI       2569 ms
+  apply hits                 1447 ms
+  tri-tri-tri                 445 ms
+  findIntersections         10380 ms
+  subdivide prepare          1248 ms
+  then Triangle abort.  No resolve mesh.  No hull.
+
+----- CORK_LBVH=1 -----
+  LBVH leaves (tris)    9,805,834
+  LBVH build               3249 ms
+  LBVH query + narrow      4044 ms
+  findIntersections       10310 ms   (same hits / tprobs)
+  then Triangle abort.
+
+----- CORK_LBVH=1 CORK_LBVH_TRI=1 -----
+  LBVH leaves (edges)  14,692,430
+  LBVH build                596 ms
+  LBVH query + narrow      2118 ms
+  findIntersections        4939 ms   (same hits; this process was warmer /
+                                       less memory pressure after LBVH died)
+  then Triangle abort.
+
+----- CORK_AUTOPOLICY=1 -----
+  Still parallel on this size (n >> 10k). Grid SI ~9.1 s, same hits,
+  then Triangle abort (two threads printed the error).
+
+----- CORK_HULL_FLOOD=1 -----
+  Not reached: outerHull(resolve=True) calls resolve first.
+
+Verdict on 30.stl: the speed flags are irrelevant until Triangle can
+finish 851k intersection polygons. SI on this soup is ~10 s on the
+grid path (4.7B cell pairs). LBVH does not reduce hits and still
+loses to / ties the grid. No result STL written.

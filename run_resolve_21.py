@@ -45,15 +45,9 @@ def main():
 
     path = Path(args.stl)
     print(f"Loading {path}")
-    mesh = trimesh.load_mesh(str(path), force="mesh", process=False)
-    if isinstance(mesh, trimesh.Scene):
-        mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
-    mesh.merge_vertices()
-    mesh.update_faces(mesh.nondegenerate_faces())
-    mesh.remove_unreferenced_vertices()
-
-    verts = np.ascontiguousarray(mesh.vertices, dtype=np.float64)
-    faces = np.ascontiguousarray(mesh.faces, dtype=np.uint64)
+    verts, faces = pycork.readSTL(str(path))
+    verts = np.ascontiguousarray(verts, dtype=np.float64)
+    faces = np.ascontiguousarray(faces, dtype=np.uint64)
     o0, n0, h0 = edge_stats(faces)
     print(f"INPUT  V={len(verts):,} F={len(faces):,} open={o0} nm={n0} hist={h0}")
 
@@ -72,7 +66,8 @@ def main():
     )
 
     out_path = path.with_name(path.stem + "_resolve.stl")
-    out.export(str(out_path))
+    pycork.writeSTL(str(out_path), np.ascontiguousarray(vout, dtype=np.float64),
+                    np.ascontiguousarray(fout, dtype=np.uint64))
     print(f"Wrote {out_path}")
 
     # combined: resolve + outer hull (winding-number classification)
@@ -91,7 +86,8 @@ def main():
         f"solid={pycork.isSolid(np.ascontiguousarray(hull.vertices, dtype=np.float64), np.ascontiguousarray(hull.faces, dtype=np.uint64))}"
     )
     hull_path = path.with_name(path.stem + "_hull.stl")
-    hull.export(str(hull_path))
+    pycork.writeSTL(str(hull_path), np.ascontiguousarray(hv, dtype=np.float64),
+                    np.ascontiguousarray(hf, dtype=np.uint64))
     print(f"Wrote {hull_path}")
 
     if args.no_preview:

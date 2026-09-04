@@ -90,6 +90,7 @@ void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *s
     if (nt == 0) return;
     const int maxTries = std::max(3, raysPerPatch);
     const bool dbg = std::getenv("CORK_HULL_DEBUG") != nullptr;
+    const bool flood = std::getenv("CORK_HULL_FLOOD") != nullptr;
 
     // ------------------------------------------------------------------
     // 1. patches + face adjacency across manifold edges
@@ -344,7 +345,7 @@ void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *s
             while (nc < size && area[faces[nc]] >= 0.1 * amax) ++nc;
             nc = std::max<size_t>(nc, std::max<size_t>(1, size / 4));
             ncand[p] = (uint32_t)nc;
-            size_t S = std::max<size_t>(5, nc / 50);   // >= 5 votes when possible
+            size_t S = flood ? 1 : std::max<size_t>(5, nc / 50);
             if (S > 65536) S = 65536;
             if (S > nc) S = nc;
             sstart[p + 1] = sstart[p] + (uint32_t)S;
@@ -452,7 +453,7 @@ void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *s
     size_t nTopoFixed = 0;
     {
         CORK_PROF("  hull: topo vote (small patches)");
-        const size_t SMALL = 100;
+        const size_t SMALL = flood ? ~(size_t)0 : 100;
         for (int iter = 0; iter < 3; ++iter) {
             size_t changed = 0;
             for (size_t p = 0; p < np; ++p) {

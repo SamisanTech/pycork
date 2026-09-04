@@ -53,6 +53,7 @@
 #include <map>
 
 #include <cork/accel/aabvh.h>
+#include <cork/accel/lbvh.h>
 
 #include <cork/isct/empty3d.h>
 #include <cork/isct/quantization.h>

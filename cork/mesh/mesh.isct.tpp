@@ -365,125 +365,255 @@ public:
     struct SubdivData {
         ShortVec<GVptr, 7>  points;
         ShortVec<GEptr, 8>  edges;
-        uint                dim0 = 0, dim1 = 1;
-        double              sign_flip = 1.0;
-        std::vector<int>    tris;   // 3 indices per output triangle
+        Vec3d               origin;
+        Vec3d               u, v;           // orthonormal basis of the face
+        std::vector<int>    tris;           // 3 indices per output triangle
     };
 
+    static Vec2d proj2(const SubdivData &d, const Vec3d &p) {
+        Vec3d w = p - d.origin;
+        return Vec2d(dot(w, d.u), dot(w, d.v));
+    }
+
+    static void choose_face_basis(SubdivData &d) {
+        const Vec3d p0 = d.points[0]->coord;
+        const Vec3d e0 = d.points[1]->coord - p0;
+        const Vec3d e1 = d.points[2]->coord - p0;
+        const Vec3d n  = cross(e0, e1);
+        d.origin = p0;
+        const double n2 = len2(n);
+        const double e00 = len2(e0);
+        if (n2 > 1e-30 * (e00 + 1.0) && e00 > 1e-30) {
+            d.u = e0 / sqrt(e00);
+            d.v = normalized(cross(n, d.u));
+            return;
+        }
+        // Degenerate face: axis-aligned drop, oriented CCW when possible.
+        uint normdim = maxDim(abs(n) + Vec3d(1e-30, 1e-31, 1e-32));
+        d.u = Vec3d(0, 0, 0);
+        d.v = Vec3d(0, 0, 0);
+        d.u.v[(normdim + 1) % 3] = 1.0;
+        d.v.v[(normdim + 2) % 3] = (n.v[normdim] < 0.0) ? -1.0 : 1.0;
+    }
+
+    // Make the 2D PSLG a real planar arrangement: unique points, no
+    // zero-length or duplicate segments, T-junctions split, crossings
+    // split at an existing or newly interpolated vertex. Triangle's
+    // insertsegment/locate die on the uncleaned axis-drop graph.
+    void sanitize_pslg(IsctProblem *iprob, SubdivData &d) {
+        std::vector<GVptr> pts;
+        pts.reserve(d.points.size() + 4);
+        for (GVptr p : d.points) pts.push_back(p);
+        std::vector<GEptr> eds;
+        eds.reserve(d.edges.size() + 8);
+        for (GEptr e : d.edges) eds.push_back(e);
+
+        auto xy = [&](GVptr p) { return proj2(d, p->coord); };
+
+        double extent = 0.0;
+        for (GVptr p : pts) {
+            Vec2d q = xy(p);
+            extent = std::max(extent, std::max(std::fabs(q.x), std::fabs(q.y)));
+        }
+        const double eps  = std::max(1e-14, 1e-10 * std::max(extent, 1.0));
+        const double eps2 = eps * eps;
+
+        auto on_seg = [&](GVptr a, GVptr b, GVptr c) -> bool {
+            if (c == a || c == b) return false;
+            Vec2d A = xy(a), B = xy(b), C = xy(c);
+            Vec2d ab = B - A, ac = C - A;
+            double ab2 = len2(ab);
+            if (ab2 <= eps2) return false;
+            double dist = std::fabs(ab.x * ac.y - ab.y * ac.x) / std::sqrt(ab2);
+            if (dist > eps) return false;
+            double t = dot(ac, ab) / ab2;
+            return t > 1e-8 && t < 1.0 - 1e-8;
+        };
+
+        auto proper_isct = [&](GVptr a, GVptr b, GVptr c, GVptr d,
+                               double &t, double &s) -> bool {
+            if (a == c || a == d || b == c || b == d) return false;
+            Vec2d A = xy(a), B = xy(b), C = xy(c), D = xy(d);
+            Vec2d ab = B - A, cd = D - C, ac = C - A;
+            double den = ab.x * cd.y - ab.y * cd.x;
+            if (std::fabs(den) <= eps2) return false;
+            t = (ac.x * cd.y - ac.y * cd.x) / den;
+            s = (ac.x * ab.y - ac.y * ab.x) / den;
+            return t > 1e-8 && t < 1.0 - 1e-8 && s > 1e-8 && s < 1.0 - 1e-8;
+        };
+
+        auto drop_bad_edges = [&]() {
+            std::vector<GEptr> keep;
+            keep.reserve(eds.size());
+            for (GEptr e : eds) {
+                if (!e->ends[0] || !e->ends[1] || e->ends[0] == e->ends[1])
+                    continue;
+                if (len2(xy(e->ends[1]) - xy(e->ends[0])) <= eps2)
+                    continue;
+                bool dup = false;
+                for (GEptr k : keep) {
+                    if ((k->ends[0] == e->ends[0] && k->ends[1] == e->ends[1]) ||
+                        (k->ends[0] == e->ends[1] && k->ends[1] == e->ends[0])) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) keep.push_back(e);
+            }
+            eds.swap(keep);
+        };
+
+        bool changed = true;
+        for (int pass = 0; changed && pass < 24; ++pass) {
+            changed = false;
+
+            // Merge 2D-coincident vertices (keep the earlier one).
+            for (size_t i = 0; i < pts.size(); ++i) {
+                Vec2d A = xy(pts[i]);
+                for (size_t j = i + 1; j < pts.size(); ++j) {
+                    if (len2(xy(pts[j]) - A) > eps2) continue;
+                    GVptr keep = pts[i], drop = pts[j];
+                    for (GEptr e : eds) {
+                        if (e->ends[0] == drop) e->ends[0] = keep;
+                        if (e->ends[1] == drop) e->ends[1] = keep;
+                    }
+                    pts.erase(pts.begin() + (std::ptrdiff_t)j);
+                    changed = true;
+                    --j;
+                }
+            }
+            drop_bad_edges();
+
+            // T-junctions: an existing vertex sits on a segment.
+            for (size_t ei = 0; ei < eds.size(); ++ei) {
+                GEptr e = eds[ei];
+                GVptr a = e->ends[0], b = e->ends[1];
+                bool split = false;
+                for (GVptr c : pts) {
+                    if (!on_seg(a, b, c)) continue;
+                    SEptr s0 = iprob->newSplitEdge(a, c, e->boundary);
+                    SEptr s1 = iprob->newSplitEdge(c, b, e->boundary);
+                    eds[ei] = s0;
+                    eds.push_back(s1);
+                    changed = true;
+                    split = true;
+                    break;
+                }
+                if (split) break; // restart scans after topology change
+            }
+            if (changed) continue;
+
+            // Crossings: two segments meet in the face without a vertex.
+            bool did_cross = false;
+            for (size_t i = 0; i < eds.size() && !did_cross; ++i) {
+                for (size_t j = i + 1; j < eds.size(); ++j) {
+                    double t = 0, s = 0;
+                    GVptr a = eds[i]->ends[0], b = eds[i]->ends[1];
+                    GVptr c = eds[j]->ends[0], dd = eds[j]->ends[1];
+                    if (!proper_isct(a, b, c, dd, t, s)) continue;
+
+                    Vec3d p3 = a->coord + t * (b->coord - a->coord);
+                    GVptr hit = nullptr;
+                    Vec2d Wp = proj2(d, p3);
+                    for (GVptr p : pts) {
+                        if (len2(xy(p) - Wp) <= eps2) { hit = p; break; }
+                    }
+                    if (!hit) {
+                        GluePt g = iprob->newGluePt();
+                        g->split_type = true;
+                        g->e = the_tri->edges[0];
+                        IVptr iv = iprob->newSplitIsctVert(p3, g);
+                        iv->boundary = false;
+                        hit = iv;
+                        pts.push_back(hit);
+                    }
+                    bool bi = eds[i]->boundary, bj = eds[j]->boundary;
+                    eds[i] = iprob->newSplitEdge(a, hit, bi);
+                    eds.push_back(iprob->newSplitEdge(hit, b, bi));
+                    eds[j] = iprob->newSplitEdge(c, hit, bj);
+                    eds.push_back(iprob->newSplitEdge(hit, dd, bj));
+                    changed = true;
+                    did_cross = true;
+                    break;
+                }
+            }
+        }
+        drop_bad_edges();
+
+        d.points.resize(0);
+        for (GVptr p : pts) d.points.push_back(p);
+        d.edges.resize(0);
+        for (GEptr e : eds) d.edges.push_back(e);
+        for (uint i = 0; i < d.points.size(); i++) d.points[i]->idx = i;
+        for (uint i = 0; i < d.edges.size(); i++)  d.edges[i]->idx  = i;
+    }
+
     void subdivide_prepare(IsctProblem *iprob, SubdivData &d) {
-        // collect all the points, and create more points as necessary
         ShortVec<GVptr, 7> &points = d.points;
-        for(uint k=0; k<3; k++) {
+        for (uint k = 0; k < 3; k++)
             points.push_back(overts[k]);
-        }
-        for(IVptr iv : iverts) {
+        for (IVptr iv : iverts)
             points.push_back(iv);
-        }
-        for(uint i=0; i<points.size(); i++)
-            points[i]->idx = i;
-        
-        // split edges and marshall data
-        // for safety, we zero out references to pre-subdivided edges,
-        // which may have been destroyed
+
         ShortVec<GEptr, 8> &edges = d.edges;
-        for(uint k=0; k<3; k++) {
+        for (uint k = 0; k < 3; k++) {
             subdivideEdge(iprob, oedges[k], edges);
-            oedges[k]       = nullptr;
+            oedges[k] = nullptr;
         }
-        for(IEptr &ie : iedges) {
+        for (IEptr &ie : iedges) {
             subdivideEdge(iprob, ie, edges);
-            ie              = nullptr;
+            ie = nullptr;
         }
-        for(uint i=0; i<edges.size(); i++)
-            edges[i]->idx = i;
-        
-        // find 2 dimensions to project onto
-        // get normal
-        Vec3d normal = cross( overts[1]->coord - overts[0]->coord,
-                              overts[2]->coord - overts[0]->coord );
-        uint normdim = maxDim(abs(normal));
-        d.dim0 = (normdim+1)%3;
-        d.dim1 = (normdim+2)%3;
-        d.sign_flip = (normal.v[normdim] < 0.0)? -1.0 : 1.0;
+
+        choose_face_basis(d);
+        sanitize_pslg(iprob, d);
     }
 
     static void subdivide_triangulate(SubdivData &d) {
         const ShortVec<GVptr, 7> &points = d.points;
         const ShortVec<GEptr, 8> &edges  = d.edges;
         struct triangulateio in, out;
-        
-        /* Define input points. */
-        in.numberofpoints           = points.size();
+
+        in.numberofpoints           = (int)points.size();
         in.numberofpointattributes  = 0;
         in.pointlist                = (double*)malloc(sizeof(double) * in.numberofpoints * 2);
         in.pointattributelist       = nullptr;
         in.pointmarkerlist          = (int*)malloc(sizeof(int) * in.numberofpoints);
-        for(int k=0; k<in.numberofpoints; k++) {
-            in.pointlist[k*2 + 0] = points[k]->coord.v[d.dim0];
-            in.pointlist[k*2 + 1] = points[k]->coord.v[d.dim1] * d.sign_flip;
+        for (int k = 0; k < in.numberofpoints; k++) {
+            Vec2d q = proj2(d, points[k]->coord);
+            in.pointlist[k*2 + 0] = q.x;
+            in.pointlist[k*2 + 1] = q.y;
             in.pointmarkerlist[k] = (points[k]->boundary)? 1 : 0;
+            points[k]->idx = (uint)k;
         }
-        
-        /* Define the input segments */
-        in.numberofsegments = edges.size();
-        in.numberofholes = 0;// yes, zero
-        in.numberofregions = 0;// not using regions
+
+        in.numberofsegments = (int)edges.size();
+        in.numberofholes = 0;
+        in.numberofregions = 0;
         in.segmentlist = (int*)malloc(sizeof(int) * in.numberofsegments * 2);
         in.segmentmarkerlist = (int*)malloc(sizeof(int) * in.numberofsegments);
-        for(int k=0; k<in.numberofsegments; k++) {
-            in.segmentlist[k*2 + 0] = edges[k]->ends[0]->idx;
-            in.segmentlist[k*2 + 1] = edges[k]->ends[1]->idx;
+        for (int k = 0; k < in.numberofsegments; k++) {
+            in.segmentlist[k*2 + 0] = (int)edges[k]->ends[0]->idx;
+            in.segmentlist[k*2 + 1] = (int)edges[k]->ends[1]->idx;
             in.segmentmarkerlist[k] = (edges[k]->boundary)? 1 : 0;
         }
-        
-        // to be safe... declare 0 triangle attributes on input
+
         in.numberoftriangles = 0;
         in.numberoftriangleattributes = 0;
-        
-        /* set for flags.... */
+
         out.pointlist = nullptr;
-        out.pointattributelist = nullptr; // not necessary if using -N or 0 attr
+        out.pointattributelist = nullptr;
         out.pointmarkerlist = nullptr;
-        out.trianglelist = nullptr; // not necessary if using -E
-        out.segmentlist = nullptr; // NEED THIS; output segments go here
-        out.segmentmarkerlist = nullptr; // NEED THIS for OUTPUT SEGMENTS
-                
-        // solve the triangulation problem
+        out.trianglelist = nullptr;
+        out.segmentlist = nullptr;
+        out.segmentmarkerlist = nullptr;
+
         char *params = (char*)("pzQYY");
         triangulate(params, &in, &out, nullptr);
-        
-        if(out.numberofpoints != in.numberofpoints) {
-            std::cout << "out.numberofpoints: "
-                      << out.numberofpoints << std::endl;
-            std::cout << "points.size(): " << points.size() << std::endl;
-            std::cout << "dumping out the points' coordinates" << std::endl;
-            for(uint k=0; k<points.size(); k++) {
-                GVptr gv = points[k];
-                std::cout << "  " << gv->coord
-                          << "  " << gv->idx << std::endl;
-            }
-            
-            std::cout << "dumping out the segments" << std::endl;
-            for(int k=0; k<in.numberofsegments; k++)
-                std::cout << "  " << in.segmentlist[k*2 + 0]
-                          << "; " << in.segmentlist[k*2 + 1]
-                          << " (" << in.segmentmarkerlist[k]
-                          << ") " << std::endl;
-            
-            std::cout << "dumping out the solved for triangles now..."
-                      << std::endl;
-            for(int k=0; k<out.numberoftriangles; k++) {
-                std::cout << "  "
-                          << out.trianglelist[(k*3)+0] << "; "
-                          << out.trianglelist[(k*3)+1] << "; "
-                          << out.trianglelist[(k*3)+2] << std::endl;
-            }
-        }
+
         ENSURE(out.numberofpoints == in.numberofpoints);
-        
         d.tris.assign(out.trianglelist, out.trianglelist + 3*out.numberoftriangles);
-        
-        // clean up after triangulate...
+
         free(in.pointlist);
         free(in.pointmarkerlist);
         free(in.segmentlist);
@@ -537,19 +667,17 @@ private:
             // get rid of old edge
                         iprob->releaseEdge(ge);
         } else { // sorting is the uncommon case
-            // determine the primary dimension and direction of the edge
+            // Parameterize along the actual 3D edge. Sorting on a single
+            // axis (old code) reverses or ties when the edge is diagonal
+            // or nearly perpendicular to its longest component, which
+            // then feeds Triangle a self-overlapping PSLG.
             Vec3d       dir     = ge->ends[1]->coord - ge->ends[0]->coord;
-            uint        dim     = (fabs(dir.x) > fabs(dir.y))?
-                                    ((fabs(dir.x) > fabs(dir.z))? 0 : 2) :
-                                    ((fabs(dir.y) > fabs(dir.z))? 1 : 2);
-            double      sign    = (dir.v[dim] > 0.0)? 1.0 : -1.0;
+            Vec3d       origin  = ge->ends[0]->coord;
             
-            // pack the interior vertices into a vector for sorting
             std::vector< std::pair<double,IVptr> > verts;
             for(IVptr iv : ge->interior) {
                         verts.push_back(std::make_pair(
-                            // if the sort is ascending, then we're good...
-                            sign * iv->coord.v[dim],
+                            dot(iv->coord - origin, dir),
                             iv
                         ));
             }
@@ -1185,6 +1313,74 @@ bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
         });
     }
 
+    const bool useLBVH = std::getenv("CORK_LBVH") != nullptr;
+    std::vector<EdgeTriHit> hits;
+    int any_degen = 0;
+
+    if (useLBVH) {
+        const bool queryTris = std::getenv("CORK_LBVH_TRI") != nullptr;
+        cork_lbvh::LBVH tree;
+        {
+            CORK_PROF("      LBVH build");
+            if (queryTris) tree.build(ebb.data(), ne, world);
+            else           tree.build(tbb_.data(), nt, world);
+            cork_prof::note("      LBVH leaves", (double)tree.n);
+        }
+        {
+            CORK_PROF("      LBVH query + narrow");
+            cork_par::Local<std::vector<EdgeTriHit>> tls_hits;
+            cork_par::Local<int> tls_degen([] { return 0; });
+            cork_par::Local<std::array<long long, 3>> tls_cnt([] { return std::array<long long, 3>{0, 0, 0}; });
+            auto handle_pair = [&](uint32_t ei, uint32_t ti, std::vector<EdgeTriHit> &local_hits, std::array<long long, 3> &cnt) {
+                const EdgeRec &er = erec[ei];
+                const TriRec &tr = trec[ti];
+                if (er.v[0] == tr.v[0] || er.v[0] == tr.v[1] || er.v[0] == tr.v[2] ||
+                    er.v[1] == tr.v[0] || er.v[1] == tr.v[1] || er.v[1] == tr.v[2]) return;
+                if (!hasIsct(tbb_[ti], ebb[ei])) return;
+                cnt[0]++;
+                empty3d::TriEdgeIn input;
+                input.edge.p[0] = er.p[0]; input.edge.p[1] = er.p[1];
+                input.tri.p[0] = tr.p[0]; input.tri.p[1] = tr.p[1]; input.tri.p[2] = tr.p[2];
+                if (!empty3d::emptyExact(input)) {
+                    EdgeTriHit h;
+                    h.ti = ti; h.ei = ei;
+                    h.coord = empty3d::coordsExact(input);
+                    local_hits.push_back(h);
+                }
+            };
+            if (queryTris) {
+            cork_par::for_each_idx(nt, 64, [&](size_t ti) {
+                auto &local_hits = tls_hits.local();
+                auto &cnt = tls_cnt.local();
+                empty3d::degeneracy_count = 0;
+                cork_lbvh::BoxF q = cork_lbvh::toBoxF(tbb_[ti]);
+                tree.query(q, [&](uint32_t ei) { handle_pair(ei, (uint32_t)ti, local_hits, cnt); });
+                tls_degen.local() += empty3d::degeneracy_count;
+                empty3d::degeneracy_count = 0;
+            });
+            } else {
+            cork_par::for_each_idx(ne, 64, [&](size_t ei) {
+                auto &local_hits = tls_hits.local();
+                auto &cnt = tls_cnt.local();
+                empty3d::degeneracy_count = 0;
+                cork_lbvh::BoxF q = cork_lbvh::toBoxF(ebb[ei]);
+                tree.query(q, [&](uint32_t ti) { handle_pair((uint32_t)ei, ti, local_hits, cnt); });
+                tls_degen.local() += empty3d::degeneracy_count;
+                empty3d::degeneracy_count = 0;
+            });
+            }
+            tls_hits.combine_each([&](std::vector<EdgeTriHit> &v) { hits.insert(hits.end(), v.begin(), v.end()); });
+            tls_degen.combine_each([&](int d) { any_degen += d; });
+            long long tot0 = 0;
+            tls_cnt.combine_each([&](const std::array<long long, 3> &c) { tot0 += c[0]; });
+            cork_prof::note("      #filter calls (bbox pass)", (double)tot0);
+            cork_prof::note("      #edge-tri hits", (double)hits.size());
+            cork_par::sort(hits.begin(), hits.end(), [](const EdgeTriHit &a, const EdgeTriHit &b) {
+                return a.ti < b.ti || (a.ti == b.ti && a.ei < b.ei);
+            });
+        }
+    } else {
+
     // ---- cell grid ----
     CellGrid grid;
     {
@@ -1235,8 +1431,6 @@ bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
     }
 
     // ---- merge join + narrow phase + exact coordinates (parallel) ----
-    std::vector<EdgeTriHit> hits;
-    int any_degen = 0;
     {
         CORK_PROF("      parallel edge-tri SI");
         std::vector<size_t> starts;
@@ -1342,6 +1536,8 @@ bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
             return a.ti < b.ti || (a.ti == b.ti && a.ei < b.ei);
         });
     }
+
+    } // !useLBVH
 
     if (any_degen > 0) {
         empty3d::degeneracy_count = any_degen;

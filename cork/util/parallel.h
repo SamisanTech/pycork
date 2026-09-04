@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -18,15 +19,26 @@
 
 namespace cork_par {
 
+// Serial if n is below `threshold` (Manifold autoPolicy).  Default 0 = always
+// honor grain / TBB.  Set CORK_AUTOPOLICY=1 to use 10000.
+inline size_t auto_threshold() {
+    static int t = -1;
+    if (t < 0) t = std::getenv("CORK_AUTOPOLICY") ? 10000 : 0;
+    return (size_t)t;
+}
+
 // f(begin, end) over [0, n) split in chunks of about `grain`
 template<class F>
 inline void for_range(size_t n, size_t grain, F &&f)
 {
+    if (n == 0) return;
+    const size_t thr = auto_threshold();
+    if (thr && n <= thr) { f((size_t)0, n); return; }
 #if defined(CORK_USE_TBB)
     tbb::parallel_for(tbb::blocked_range<size_t>(0, n, grain),
         [&](const tbb::blocked_range<size_t> &r) { f(r.begin(), r.end()); });
 #else
-    if (n) f((size_t)0, n);
+    f((size_t)0, n);
 #endif
 }
 
