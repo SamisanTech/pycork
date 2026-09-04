@@ -464,25 +464,41 @@ public:
             eds.swap(keep);
         };
 
+        // Stock cork never sanitized. Only mutate when Triangle would
+        // die: a T-junction or a proper crossing. 2D-only vertex welds
+        // on a clean PSLG opened slc 21.stl (open=2/3, ~0.7s still).
+        bool dirty = false;
+        for (size_t ei = 0; ei < eds.size() && !dirty; ++ei) {
+            GVptr a = eds[ei]->ends[0], b = eds[ei]->ends[1];
+            if (!a || !b) continue;
+            for (GVptr c : pts) {
+                if (on_seg(a, b, c)) { dirty = true; break; }
+            }
+        }
+        for (size_t i = 0; i < eds.size() && !dirty; ++i) {
+            for (size_t j = i + 1; j < eds.size(); ++j) {
+                double t = 0, s = 0;
+                if (proper_isct(eds[i]->ends[0], eds[i]->ends[1],
+                                eds[j]->ends[0], eds[j]->ends[1], t, s)) {
+                    dirty = true;
+                    break;
+                }
+            }
+        }
+        if (!dirty) {
+            drop_bad_edges();
+            d.points.resize(0);
+            for (GVptr p : pts) d.points.push_back(p);
+            d.edges.resize(0);
+            for (GEptr e : eds) d.edges.push_back(e);
+            for (uint i = 0; i < d.points.size(); i++) d.points[i]->idx = i;
+            for (uint i = 0; i < d.edges.size(); i++)  d.edges[i]->idx  = i;
+            return;
+        }
+
         bool changed = true;
         for (int pass = 0; changed && pass < 24; ++pass) {
             changed = false;
-
-            // Merge 2D-coincident vertices (keep the earlier one).
-            for (size_t i = 0; i < pts.size(); ++i) {
-                Vec2d A = xy(pts[i]);
-                for (size_t j = i + 1; j < pts.size(); ++j) {
-                    if (len2(xy(pts[j]) - A) > eps2) continue;
-                    GVptr keep = pts[i], drop = pts[j];
-                    for (GEptr e : eds) {
-                        if (e->ends[0] == drop) e->ends[0] = keep;
-                        if (e->ends[1] == drop) e->ends[1] = keep;
-                    }
-                    pts.erase(pts.begin() + (std::ptrdiff_t)j);
-                    changed = true;
-                    --j;
-                }
-            }
             drop_bad_edges();
 
             // T-junctions: an existing vertex sits on a segment.
@@ -567,7 +583,9 @@ public:
         }
 
         choose_face_basis(d);
-        sanitize_pslg(iprob, d);
+        // Stock cork never sanitized. Always-on (or T/cross-only) opened
+        // slc 21.stl resolve on some perturbs (open=2/3). Leave the
+        // helper for a Triangle-failure retry if a later mesh needs it.
     }
 
     static void subdivide_triangulate(SubdivData &d) {

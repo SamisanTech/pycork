@@ -769,3 +769,24 @@ NM ALL 17  (no skips, timeout 300s)
   watertight solid: 29 only
   28_danger_1 still worse (nm 2->734 open 2->1513)
 
+----------------------------------------------------------------
+SNAPSHOT 34bb730 then bring back cork bits
+  committed repair wrap / leftover prune / throw-not-exit
+  outerHull leftover default restored to 0 (304f9f5 / pycork.outerHull)
+  repair() still passes 0.001 so slc 21 1-shell gate unchanged
+  hull BFS-orient so cork isClosed() directed edges agree
+  slc 21  1.003s  465,004 / 930,634  wt  winding_ok=True  vol=484.637
+  (winding_ok was False). isSolid still False: isSelfIntersecting
+  fires on leftover degeneracies (same cork check).
+  NM 29 still solid 0.01s
+
+----------------------------------------------------------------
+RESOLVE FINGERPRINT  (match stock, no time hit)
+  Always-on PSLG sanitize (304f9f5) opened slc 21 resolve on
+  some perturbs (open=2/3). Stock never sanitized.
+  Sanitize is off; helper stays for a Triangle-failure retry.
+  resolve 5/5  open=0  vol=556.736  ~0.64-0.70s  (was ~0.70 + holes)
+  V/F in stock band (~714.4k / 1.595M)
+  repair still 1.01s  1 shell wt vol=484.637424
+    V/F 464,990 / 930,606  (was 465,004 / 930,634; hull leftover)
+

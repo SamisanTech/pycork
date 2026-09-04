@@ -7,11 +7,11 @@ from pathlib import Path
 
 PY = r"C:\Users\Karan\AppData\Local\Programs\Python\Python39\python.exe"
 CHILD = Path(r"E:\github.com\pycork\run_nm_batch.py")
-OUT_JSON = Path(r"E:\github.com\pycork\more_batch_results.json")
+OUT_JSON = Path(r"E:\github.com\pycork\working_results.json")
 TIMEOUT = 180
-# Folder-local skips. NM 26/27 hang; Impossible 26/27 are different files.
+# Hang-only skips. 27 / 28_danger finished last NM-all pass.
 SKIP = {
-    "Non Manifold": {"20.stl", "26.stl", "27.stl", "28_danger.stl"},
+    "Non Manifold": {"20.stl", "26.stl"},
     "Stitching": set(),
     "Impossible": {
         "MFUE2460(2) J2.stl",

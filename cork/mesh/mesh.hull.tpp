@@ -580,6 +580,80 @@ void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *s
         cork_prof::note("  hull: sliver faces pruned", (double)nPruned);
     }
 
+    // Cork isClosed() is directed: each edge (a→b)+1, (b→a)−1.
+    // Undirected valence-2 can still fail isSolid if neighbors agree.
+    // One BFS on the last kept graph — same cost class as one prune pass.
+    if (hullClosed) {
+        CORK_PROF("  hull: orient (cork isClosed)");
+        std::vector<uint32_t> kept;
+        kept.reserve(nt);
+        for (size_t i = 0; i < nt; ++i)
+            if (faceCode[i] != HULL_DELETE) kept.push_back((uint32_t)i);
+        const size_t nk = kept.size();
+        if (nk >= 2) {
+            struct EK { uint64_t key; uint32_t tri; };
+            RawArray<EK> ek(3 * nk);
+            cork_par::for_each_idx(nk, 8192, [&](size_t j) {
+                const Tri &t = tris[kept[j]];
+                for (uint k = 0; k < 3; ++k) {
+                    uint a = t.v[(k + 1) % 3], b = t.v[(k + 2) % 3];
+                    uint lo = std::min(a, b), hi = std::max(a, b);
+                    ek[3 * j + k].key = ((uint64_t)lo << 32) | (uint64_t)hi;
+                    ek[3 * j + k].tri = (uint32_t)j;
+                }
+            });
+            cork_par::sort(ek.begin(), ek.end(), [](const EK &x, const EK &y) {
+                return x.key < y.key || (x.key == y.key && x.tri < y.tri);
+            });
+            struct Nbr { uint32_t tri; uint32_t lo, hi; };
+            std::vector<Nbr> adj(nk * 3);
+            std::vector<uint8_t> nadj(nk, 0);
+            const size_t n3 = ek.size();
+            for (size_t i = 0; i < n3;) {
+                size_t j = i + 1;
+                while (j < n3 && ek[j].key == ek[i].key) ++j;
+                if (j - i == 2) {
+                    const uint32_t a = ek[i].tri, b = ek[i + 1].tri;
+                    const uint32_t lo = (uint32_t)(ek[i].key >> 32);
+                    const uint32_t hi = (uint32_t)ek[i].key;
+                    if (nadj[a] < 3) adj[a * 3 + nadj[a]++] = {b, lo, hi};
+                    if (nadj[b] < 3) adj[b * 3 + nadj[b]++] = {a, lo, hi};
+                }
+                i = j;
+            }
+            auto uses_dir = [&](uint32_t tid, bool flip, uint32_t u, uint32_t v) {
+                uint a = tris[tid].a, b = tris[tid].b, c = tris[tid].c;
+                if (flip) std::swap(a, b);
+                return (a == u && b == v) || (b == u && c == v) || (c == u && a == v);
+            };
+            std::vector<char> vis(nk, 0);
+            std::vector<uint32_t> stack;
+            stack.reserve(nk);
+            for (size_t s = 0; s < nk; ++s) {
+                if (vis[s]) continue;
+                vis[s] = 1;
+                stack.push_back((uint32_t)s);
+                while (!stack.empty()) {
+                    const uint32_t j = stack.back();
+                    stack.pop_back();
+                    const uint32_t tid = kept[j];
+                    const bool flipJ = faceCode[tid] == HULL_FLIP;
+                    for (uint e = 0; e < nadj[j]; ++e) {
+                        const Nbr &nb = adj[j * 3 + e];
+                        if (vis[nb.tri]) continue;
+                        const uint32_t uid = kept[nb.tri];
+                        const bool flipK = faceCode[uid] == HULL_FLIP;
+                        if (uses_dir(tid, flipJ, nb.lo, nb.hi) ==
+                            uses_dir(uid, flipK, nb.lo, nb.hi))
+                            faceCode[uid] = flipK ? HULL_KEEP : HULL_FLIP;
+                        vis[nb.tri] = 1;
+                        stack.push_back(nb.tri);
+                    }
+                }
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // 4. rebuild verts / tris
     // ------------------------------------------------------------------
