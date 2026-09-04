@@ -66,6 +66,15 @@ public: // main use functions
     T* alloc();
     void free(T*);
 
+    // Allocate a dedicated chunk of exactly n blocks and hand it to the
+    // caller as a contiguous array (NOT threaded into the free list).
+    // The caller owns the layout of those blocks until they are free()'d
+    // one by one, or the pool is cleared/destroyed.
+    T* allocContiguous(int n);
+
+    // Destroy every chunk and reset to a tiny empty pool.
+    void release();
+
 private: // internal data structures
     union Block {
         byte   datum[sizeof(T)]; // enough space for a T
@@ -79,18 +88,15 @@ private: // internal data structures
 private: // internal data instances
     Chunk  *chunk_list;
     Block  *free_list;
+    int     growth;      // size of the next growth chunk
 private: // helper functions
     void addChunk(); // this should be called only when the free list is empty
+    void initSmall(int nBlocks);
 };
 
 template<class T>
-MemPool<T>::MemPool(int minInitBlocks)
+void MemPool<T>::initSmall(int nBlocks)
 {
-    // decide on the size of the first chunk
-    const int MIN_BLOCKS = 2; // will not create a pool with fewer
-                              // than 2 blocks
-    int nBlocks = std::max(minInitBlocks, MIN_BLOCKS);
-    
     // allocate the first chunk
     chunk_list          = (Chunk*)(new byte[sizeof(Chunk)]);
     chunk_list->next    = NULL;
@@ -103,11 +109,21 @@ MemPool<T>::MemPool(int minInitBlocks)
     for(Block *it = free_list; it != last_block; it++)
         it->next = it+1;
     last_block->next    = NULL;
+    growth              = nBlocks * 2;
+}
+
+template<class T>
+MemPool<T>::MemPool(int minInitBlocks)
+{
+    // decide on the size of the first chunk
+    const int MIN_BLOCKS = 2; // will not create a pool with fewer
+                              // than 2 blocks
+    initSmall(std::max(minInitBlocks, MIN_BLOCKS));
 }
 
 template<class T>
 MemPool<T>::MemPool(MemPool &&src)
-    : chunk_list(src.chunk_list), free_list(src.free_list)
+    : chunk_list(src.chunk_list), free_list(src.free_list), growth(src.growth)
 {
     src.chunk_list = nullptr;
     src.free_list = nullptr;
@@ -118,6 +134,7 @@ void MemPool<T>::operator=(MemPool &&src)
 {
     chunk_list = src.chunk_list;
     free_list = src.free_list;
+    growth = src.growth;
     src.chunk_list = nullptr;
     src.free_list = nullptr;
 }
@@ -133,6 +150,31 @@ MemPool<T>::~MemPool()
         delete[] (byte*)(chunk_list);
         chunk_list = next;
     }
+}
+
+template<class T>
+void MemPool<T>::release()
+{
+    while(chunk_list != NULL) {
+        delete[] (byte*)(chunk_list->data);
+        Chunk *next = chunk_list->next;
+        delete[] (byte*)(chunk_list);
+        chunk_list = next;
+    }
+    free_list = nullptr;
+    initSmall(2);
+}
+
+template<class T>
+T* MemPool<T>::allocContiguous(int n)
+{
+    if(n <= 0) return nullptr;
+    Chunk *new_chunk    = (Chunk*)(new byte[sizeof(Chunk)]);
+    new_chunk->next     = chunk_list;
+    new_chunk->nBlocks  = n;
+    new_chunk->data     = (Block*)(new byte[sizeof(Block) * (size_t)n]);
+    chunk_list          = new_chunk;
+    return reinterpret_cast<T*>(new_chunk->data);
 }
 
 template<class T>
@@ -191,9 +233,12 @@ void MemPool<T>::addChunk()
     // we always double the size of each new chunk.  This ensures that
     // the total # of times that we have to add chunks is logarithmic.
     // Regardless, the amortized cost of chunk allocation is constant.
-    new_chunk->nBlocks  = chunk_list->nBlocks * 2;
+    // (growth is tracked separately so that a huge allocContiguous chunk
+    //  does not make the next incremental chunk absurdly large)
+    new_chunk->nBlocks  = growth;
+    growth              = growth * 2;
     new_chunk->data     = (Block*)(new byte[sizeof(Block) * 
-                                            (new_chunk->nBlocks)]);
+                                            (size_t)(new_chunk->nBlocks)]);
     chunk_list          = new_chunk;
     
     // now we need to lace the blocks of the fresh chunk up into the free_list

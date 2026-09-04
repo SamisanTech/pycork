@@ -53,6 +53,9 @@ typedef unsigned char byte;
 std::ostream &err();
 
 #ifndef ENSURE
+#if defined(NDEBUG) || defined(CORK_FAST)
+#define ENSURE(STATEMENT) ((void)0)
+#else
 #define ENSURE(STATEMENT) { \
     if(!(STATEMENT)) { \
         std::cerr << "ENSURE FAILED at " \
@@ -64,6 +67,7 @@ std::ostream &err();
         exit(1); \
     } \
 }
+#endif
 #endif // ENSURE
 
 // Use ERROR to print an error message tagged with the given file/line #

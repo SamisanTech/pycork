@@ -26,6 +26,7 @@
 #include "cork.h"
 
 #include <cork/mesh/mesh.h>
+#include <cork/util/parallel.h>
 
 typedef Mesh<CorkVertex, CorkTriangle> CorkMesh;
 typedef RawMesh<CorkVertex, CorkTriangle> RawCorkMesh;
@@ -107,15 +108,12 @@ void eigenToCorkMesh(const Eigen::Matrix<double, Eigen::Dynamic, 3> &verts,
      * Due to Row-Major ordering in Numpy Arrays, it is more efficient to copy each row at a time
      */
 
-    // X Coordinatees
-    for(uint64_t i=0; i< tris.rows(); i++)
-        raw.triangles[i].a = tris(i,0);
-
-    for(uint64_t i=0; i< tris.rows(); i++)
-        raw.triangles[i].b = tris(i,1);
-
-    for(uint64_t i=0; i< tris.rows(); i++)
-        raw.triangles[i].c = tris(i,2);
+    const uint64_t nt = (uint64_t)tris.rows();
+    cork_par::for_each_idx((size_t)nt, 8192, [&](size_t i) {
+        raw.triangles[i].a = (uint)tris(i,0);
+        raw.triangles[i].b = (uint)tris(i,1);
+        raw.triangles[i].c = (uint)tris(i,2);
+    });
 
     uint64_t max_ref_idx = tris.maxCoeff();
 
@@ -131,14 +129,12 @@ void eigenToCorkMesh(const Eigen::Matrix<double, Eigen::Dynamic, 3> &verts,
         return;
     }
 
-    for(uint64_t i=0; i<verts.rows(); i++)
+    const uint64_t nv = (uint64_t)verts.rows();
+    cork_par::for_each_idx((size_t)nv, 8192, [&](size_t i) {
         raw.vertices[i].pos.x = verts(i, 0);
-
-    for(uint64_t i=0; i<verts.rows(); i++)
         raw.vertices[i].pos.y = verts(i, 1);
-
-    for(uint64_t i=0; i<verts.rows(); i++)
         raw.vertices[i].pos.z = verts(i, 2);
+    });
 
     *mesh = CorkMesh(raw);
 
@@ -148,25 +144,22 @@ void corkMesh2Eigen(const CorkMesh &mesh,
                     Eigen::Matrix<double, Eigen::Dynamic, 3> &verts,
                     Eigen::Matrix<uint64_t, Eigen::Dynamic, 3> &tris)
 {
+    verts.resize(mesh.numVerts(), Eigen::NoChange);
+    tris.resize(mesh.numTris(), Eigen::NoChange);
 
-    const RawCorkMesh raw = mesh.raw();
-
-    verts.resize(raw.vertices.size(), Eigen::NoChange);
-    tris.resize(raw.triangles.size(), Eigen::NoChange);
-
-    // Note: Unfortunatly this is a relatively expensive copy due to change in Row/Column Ordering
-
-    for(uint64_t i=0; i < tris.rows(); i++) {
-        tris(i, 0) = raw.triangles[i].a;
-        tris(i, 1) = raw.triangles[i].b;
-        tris(i, 2) = raw.triangles[i].c;
-    }
-
-    for(uint64_t i=0; i< verts.rows(); i++) {
-        verts(i,0) = raw.vertices[i].pos.x;
-        verts(i,1) = raw.vertices[i].pos.y;
-        verts(i,2) = raw.vertices[i].pos.z;
-    }
+    // Column-major Eigen vs. array-of-struct cork; parallel scatter,
+    // no RawMesh intermediate copy.
+    mesh.export_parallel(
+        [&](size_t i, const CorkVertex &v) {
+            verts(i,0) = v.pos.x;
+            verts(i,1) = v.pos.y;
+            verts(i,2) = v.pos.z;
+        },
+        [&](size_t i, uint a, uint b, uint c) {
+            tris(i, 0) = a;
+            tris(i, 1) = b;
+            tris(i, 2) = c;
+        });
 }
 
 

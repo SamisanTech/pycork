@@ -1,19 +1,11 @@
 Pycork - Cork Python Library for Boolean CSG Operations on Meshes
 =============================================================================
 
-.. image:: https://github.com/drlukeparry/pycork/actions/workflows/pythonpublish.yml/badge.svg
-    :target: https://github.com/drlukeparry/pycork/actions
-.. image:: https://badge.fury.io/py/pycork.svg
-    :target: https://badge.fury.io/py/pycork
-.. image:: https://static.pepy.tech/personalized-badge/pycork?period=total&units=international_system&left_color=black&right_color=orange&left_text=Downloads
- :target: https://pepy.tech/project/pycork
-
-
-Pycork is a Python library offering the functionality of the Cork boolean CSG library in a compiler friendly form suitable across all platforms. The library includes the dependencies for the Multi-Precision Integer and Rationals (MPIR) 3.0 built-in used by the Cork libary. The package aims to provide a simpler route for compiling the package for individuals and in addition, generating python bindings for use across other projects. Refactoring has been authored to tidy up the existing codebase so that it can be built across multiple platforms, in particular Windows, using the CMake build-system. At this stage, no further optimisations or improvements will be made specifically to the cork library, inclusive of its algorithms.
+Pycork is a Python library offering the functionality of the Cork boolean CSG library in a compiler friendly form suitable across all platforms. The library includes the dependencies for the Multi-Precision Integer and Rationals (MPIR) 3.0 built-in used by the Cork libary. The package aims to provide a simpler route for compiling the package for individuals and in addition, generating python bindings for use across other projects. Refactoring has been authored to tidy up the existing codebase so that it can be built across multiple platforms, in particular Windows, using the CMake build-system.
 
 The python bindings are simple and offer access to the core functionality offered by the Cork library to perform boolean operations on watertight meshes. Additionally, it removes the awkward step of generatig .off files that are used in the command-line interface of the Cork library. The user may pass triangular meshes (vertices, tri-faces indices) as numpy arrays to each function.
 
-For further information, see the latest `release notes <https://github.com/drlukeparry/pycork/blob/master/CHANGELOG.md>`_.
+This tree also includes local speed optimizations and an outer-hull pass; see SPEED_LOG.txt.
 
 Installation
 *************
@@ -35,7 +27,6 @@ Alternatively, pycork may be compiled directly from source. Currently the prereq
 
 .. code:: bash
 
-    git clone https://github.com/drlukeparry/pycork.git && cd ./pycork
     git submodule update --init --recursive
 
     python setup.py install

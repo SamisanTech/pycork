@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 #include <set>
 #include <sstream>
@@ -66,6 +67,7 @@
 #include <cork/util/iterPool.h>
 #include <cork/util/memPool.h>
 #include <cork/util/prelude.h>
+#include <cork/util/profile.h>
 #include <cork/util/shortVec.h>
 
 #include <cork/util/unionFind.h>
@@ -75,6 +77,8 @@
 extern "C" {
     #include <cork/isct/triangle.h>
 }
+
+namespace cork_hull { struct HullStats; }
 
 
 struct BoolVertexData {
@@ -197,6 +201,15 @@ public:
 
     RawMesh<VertData,TriData> raw() const;
 
+    // Parallel, copy-free export: fv(i, vert), ft(i, a, b, c)
+    template<class FV, class FT>
+    void export_parallel(FV fv, FT ft) const {
+        cork_par::for_each_idx(verts.size(), 8192, [&](size_t i) { fv(i, verts[i]); });
+        cork_par::for_each_idx(tris.size(), 8192, [&](size_t i) {
+            ft(i, tris[i].a, tris[i].b, tris[i].c);
+        });
+    }
+
     inline int numVerts() const { return verts.size(); }
     inline int numTris() const { return tris.size(); }
 
@@ -239,6 +252,11 @@ public: // ISCT (intersections) module
     void testingComputeStaticIsctPoints(std::vector<Vec3d> *points);
     void testingComputeStaticIsct(std::vector<Vec3d> *points,
                                   std::vector< std::pair<Vec3d,Vec3d> > *edges);
+
+public: // OUTER HULL module (single mesh; call after resolveIntersections)
+    // keeps only faces whose one side has generalized winding number 0,
+    // flipping faces whose *back* side is exterior.  See mesh.hull.tpp.
+    void outerHull(int raysPerPatch = 5, cork_hull::HullStats *stats = nullptr);
 
 public: // BOOLean operation module
     // all of the form
@@ -725,6 +743,9 @@ struct Mesh<VertData, TriData>::TopoCache {
 
     Mesh *mesh;
     TopoCache(Mesh *owner);
+    // vertEdges=false skips the vertex->edge incidence lists (clients that
+    // never read TopoVert::edges, e.g. IsctProblem)
+    TopoCache(Mesh *owner, bool vertEdges);
     virtual ~TopoCache() {}
 
     // until commit() is called, the Mesh::verts and Mesh::tris
@@ -751,7 +772,7 @@ struct Mesh<VertData, TriData>::TopoCache {
     inline void flipTri(Tptr);
 
 private:
-    void init();
+    void init(bool vertEdges = true);
 };
 
 
@@ -847,7 +868,12 @@ void Mesh<VertData, TriData>::TopoCache::flipTri(Tptr t)
 template<class VertData, class TriData>
 Mesh<VertData, TriData>::TopoCache::TopoCache(Mesh *owner) : mesh(owner)
 {
-    init();
+    init(true);
+}
+template<class VertData, class TriData>
+Mesh<VertData, TriData>::TopoCache::TopoCache(Mesh *owner, bool vertEdges) : mesh(owner)
+{
+    init(vertEdges);
 }
 
 
@@ -871,79 +897,105 @@ inline TopoEdgePrototype& getTopoEdgePrototype(uint a, uint b,
     return prototypes[a][N];
 }
 
+// Parallel topology construction.
+//  * vertices and triangles are bulk allocated and initialised in parallel
+//  * edges are found by sorting the 3 (min,max) vertex-id keys of every
+//    triangle; each run of equal keys is one edge
+//  * vertex incidence lists are filled from CSR buckets, one vertex per task
+// The resulting structure is identical to the original serial build
+// (same verts[0]/verts[1] ordering, same tri->edges[k] correspondence, same
+//  ascending-triangle order in incidence lists).
 template<class VertData, class TriData>
-void Mesh<VertData, TriData>::TopoCache::init()
+void Mesh<VertData, TriData>::TopoCache::init(bool vertEdges)
 {
-    // first lay out vertices
-    std::vector<Vptr> temp_verts(mesh->verts.size()); // need temp. reference
-    for(uint i=0; i<mesh->verts.size(); i++) {
-        Vptr vert = verts.alloc(); // cache.verts.alloc()
-        vert->ref = i;
-        temp_verts[i] = vert;
+    CORK_PROF("    TopoCache::init");
+    const size_t nv = mesh->verts.size();
+    const size_t nt = mesh->tris.size();
+
+    // ---- vertices ----
+    auto vb = verts.alloc_bulk((uint)nv);
+    cork_par::for_each_idx(nv, 8192, [&](size_t i) {
+        Vptr v  = vb[i];
+        v->ref  = (uint)i;
+        v->data = nullptr;
+    });
+
+    // ---- triangles ----
+    auto tb = tris.alloc_bulk((uint)nt);
+    cork_par::for_each_idx(nt, 8192, [&](size_t i) {
+        Tptr t  = tb[i];
+        t->ref  = (uint)i;
+        t->data = nullptr;
+        const Tri &rt = mesh->tris[i];
+        for(uint k=0; k<3; k++) t->verts[k] = vb[rt.v[k]];
+    });
+
+    // ---- vertex -> triangle ----
+    {
+        std::vector<unsigned> off, ord;
+        cork_par::build_csr(nv, 3*nt,
+            [&](size_t c) { return (size_t)mesh->tris[c/3].v[c%3]; }, off, ord);
+        cork_par::for_each_idx(nv, 4096, [&](size_t v) {
+            Vptr vp = vb[v];
+            for(unsigned k = off[v]; k < off[v+1]; ++k)
+                vp->tris.push_back(tb[ord[k]/3]);
+        });
     }
 
-    // We need to still do the following
-    //  * Generate TopoTris
-    //  * Generate TopoEdges
-    // ---- Hook up references between
-    //  * Triangles and Vertices
-    //  * Triangles and Edges
-    //  * Vertices and Edges
-
-    // We handle two of these items in a pass over the triangles,
-    //  * Generate TopoTris
-    //  * Hook up Triangles and Vertices
-    // building a structure to handle the edges as we go:
-    std::vector< ShortVec<TopoEdgePrototype, 8> > edgeacc(mesh->verts.size());
-    for(uint i=0; i<mesh->tris.size(); i++) {
-        Tptr tri = tris.alloc(); // cache.tris.alloc()
-        tri->ref = i;
-        const Tri &ref_tri = mesh->tris[i];
-
-        // triangles <--> verts
-        uint vids[3];
+    // ---- edges ----
+    struct EKey { uint64_t key; uint32_t tri; uint32_t k; };
+    std::vector<EKey> ek(3*nt);
+    cork_par::for_each_idx(nt, 8192, [&](size_t i) {
+        const Tri &rt = mesh->tris[i];
         for(uint k=0; k<3; k++) {
-            uint vid = vids[k] = ref_tri.v[k];
-            tri->verts[k] = temp_verts[vid];
-            temp_verts[vid]->tris.push_back(tri);
+            uint a = rt.v[(k+1)%3], b = rt.v[(k+2)%3];
+            uint lo = std::min(a,b), hi = std::max(a,b);
+            EKey &e = ek[3*i+k];
+            e.key = ((uint64_t)lo << 32) | (uint64_t)hi;
+            e.tri = (uint32_t)i;
+            e.k   = k;
         }
-        // then, put these in arbitrary but globally consistent order
-        if(vids[0] > vids[1])   std::swap(vids[0], vids[1]);
-        if(vids[1] > vids[2])   std::swap(vids[1], vids[2]);
-        if(vids[0] > vids[1])   std::swap(vids[0], vids[1]);
-        // and accrue in structure
-        getTopoEdgePrototype(vids[0], vids[1], edgeacc).tris.push_back(tri);
-        getTopoEdgePrototype(vids[0], vids[2], edgeacc).tris.push_back(tri);
-        getTopoEdgePrototype(vids[1], vids[2], edgeacc).tris.push_back(tri);
+    });
+    cork_par::sort(ek.begin(), ek.end(), [](const EKey &a, const EKey &b) {
+        if(a.key != b.key) return a.key < b.key;
+        if(a.tri != b.tri) return a.tri < b.tri;
+        return a.k < b.k;
+    });
+
+    std::vector<uint32_t> runStart;
+    runStart.reserve(3*nt/2 + 1);
+    for(size_t i=0; i<ek.size(); i++)
+        if(i == 0 || ek[i].key != ek[i-1].key) runStart.push_back((uint32_t)i);
+    runStart.push_back((uint32_t)ek.size());
+    const size_t ne = runStart.size() - 1;
+
+    auto eb = edges.alloc_bulk((uint)ne);
+    cork_par::for_each_idx(ne, 4096, [&](size_t r) {
+        Eptr e   = eb[r];
+        e->data  = nullptr;
+        uint64_t key = ek[runStart[r]].key;
+        e->verts[0] = vb[(size_t)(key >> 32)];
+        e->verts[1] = vb[(size_t)(key & 0xffffffffu)];
+        for(uint32_t idx = runStart[r]; idx < runStart[r+1]; ++idx) {
+            Tptr t = tb[ek[idx].tri];
+            e->tris.push_back(t);
+            t->edges[ek[idx].k] = e;
+        }
+    });
+
+    // ---- vertex -> edge ----
+    if(vertEdges) {
+        std::vector<unsigned> off, ord;
+        cork_par::build_csr(nv, 2*ne, [&](size_t j) {
+            uint64_t key = ek[runStart[j/2]].key;
+            return (size_t)((j & 1) ? (key & 0xffffffffu) : (key >> 32));
+        }, off, ord);
+        cork_par::for_each_idx(nv, 4096, [&](size_t v) {
+            Vptr vp = vb[v];
+            for(unsigned k = off[v]; k < off[v+1]; ++k)
+                vp->edges.push_back(eb[ord[k]/2]);
+        });
     }
-
-    // Now, we can unpack the edge accumulation to
-    //  * Generate TopoEdges
-    //  * Hook up Triangles and Edges
-    //  * Hook up Vertices and Edges
-    for(uint vid0=0; vid0 < edgeacc.size(); vid0++) {
-      for(TopoEdgePrototype &proto : edgeacc[vid0]) {
-        uint vid1 = proto.vid;
-        Vptr v0 = temp_verts[vid0];
-        Vptr v1 = temp_verts[vid1];
-
-        Eptr edge = edges.alloc(); // cache.edges.alloc()
-        // edges <--> verts
-        edge->verts[0] = v0;
-        v0->edges.push_back(edge);
-        edge->verts[1] = v1;
-        v1->edges.push_back(edge);
-        // edges <--> tris
-        for(Tptr tri : proto.tris) {
-            edge->tris.push_back(tri);
-            for(uint k=0; k<3; k++) {
-                if(v0 != tri->verts[k] && v1 != tri->verts[k]) {
-                    tri->edges[k] = edge;
-                    break;
-                }
-            }
-        }
-    }}
 
     //ENSURE(isValid());
     //print();
@@ -956,58 +1008,67 @@ template<class VertData, class TriData>
 void Mesh<VertData, TriData>::TopoCache::commit()
 {
     //ENSURE(isValid());
+    std::vector<Vptr> vv;   verts.collect(vv);
+    std::vector<Tptr> tv;   tris.collect(tv);
+    const size_t NV = mesh->verts.size();
+    const size_t NT = mesh->tris.size();
 
     // record which vertices are live
-    std::vector<bool> live_verts(mesh->verts.size(), false);
-    verts.for_each([&](Vptr vert) { // cache.verts
-        live_verts[vert->ref] = true;
+    std::vector<uint8_t> live_verts(NV, 0);
+    cork_par::for_each_idx(vv.size(), 8192, [&](size_t i) {
+        live_verts[vv[i]->ref] = 1;
     });
 
     // record which triangles are live, and record connectivity
-    std::vector<bool> live_tris(mesh->tris.size(), false);
-    tris.for_each([&](Tptr tri) { // cache.tris
-        live_tris[tri->ref] = true;
+    std::vector<uint8_t> live_tris(NT, 0);
+    cork_par::for_each_idx(tv.size(), 8192, [&](size_t i) {
+        Tptr tri = tv[i];
+        live_tris[tri->ref] = 1;
         for(uint k=0; k<3; k++)
             mesh->tris[tri->ref].v[k] = tri->verts[k]->ref;
     });
 
     // compact the vertices and build a remapping function
-    std::vector<uint> vmap(mesh->verts.size());
+    std::vector<uint> vmap(NV);
     uint write = 0;
-    for(uint read = 0; read < mesh->verts.size(); read++) {
-        if(live_verts[read]) {
-            vmap[read] = write;
-            mesh->verts[write] = mesh->verts[read];
-            write++;
-        } else {
-            vmap[read] = INVALID_ID;
-        }
+    for(size_t read = 0; read < NV; read++) {
+        if(live_verts[read]) vmap[read] = write++;
+        else                 vmap[read] = INVALID_ID;
     }
-    mesh->verts.resize(write);
+    {
+        std::vector<VertData> nverts(write);
+        cork_par::for_each_idx(NV, 8192, [&](size_t read) {
+            if(live_verts[read]) nverts[vmap[read]] = mesh->verts[read];
+        });
+        mesh->verts.swap(nverts);
+    }
 
     // rewrite the vertex reference ids
-    verts.for_each([&](Vptr vert) { // cache.verts
-        vert->ref = vmap[vert->ref];
+    cork_par::for_each_idx(vv.size(), 8192, [&](size_t i) {
+        vv[i]->ref = vmap[vv[i]->ref];
     });
 
-    std::vector<uint> tmap(mesh->tris.size());
+    std::vector<uint> tmap(NT);
     write = 0;
-    for(uint read = 0; read < mesh->tris.size(); read++) {
-        if(live_tris[read]) {
-            tmap[read] = write;
-            mesh->tris[write] = mesh->tris[read];
-            for(uint k=0; k<3; k++)
-                mesh->tris[write].v[k] = vmap[mesh->tris[write].v[k]];
-            write++;
-        } else {
-            tmap[read] = INVALID_ID;
-        }
+    for(size_t read = 0; read < NT; read++) {
+        if(live_tris[read]) tmap[read] = write++;
+        else                tmap[read] = INVALID_ID;
     }
-    mesh->tris.resize(write);
+    {
+        std::vector<Tri> ntris(write);
+        cork_par::for_each_idx(NT, 8192, [&](size_t read) {
+            if(!live_tris[read]) return;
+            Tri &dst = ntris[tmap[read]];
+            dst = mesh->tris[read];
+            for(uint k=0; k<3; k++)
+                dst.v[k] = vmap[dst.v[k]];
+        });
+        mesh->tris.swap(ntris);
+    }
 
     // rewrite the triangle reference ids
-    tris.for_each([&](Tptr tri) { // cache.tris
-        tri->ref = tmap[tri->ref];
+    cork_par::for_each_idx(tv.size(), 8192, [&](size_t i) {
+        tv[i]->ref = tmap[tv[i]->ref];
     });
 }
 
@@ -1150,6 +1211,7 @@ void Mesh<VertData, TriData>::TopoCache::print()
 #include "mesh.remesh.tpp"
 #include "mesh.isct.tpp"
 #include "mesh.bool.tpp"
+#include "mesh.hull.tpp"
 
 
 #endif

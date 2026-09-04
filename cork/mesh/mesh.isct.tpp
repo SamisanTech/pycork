@@ -25,6 +25,16 @@
 // +-------------------------------------------------------------------------
 #pragma once
 
+#include <utility>
+#include <vector>
+#include <array>
+#include <cstdint>
+#include <cmath>
+#include <algorithm>
+#include <cork/accel/bbox_avx.h>
+#include <cork/util/parallel.h>
+#include <cork/util/profile.h>
+
 struct GenericVertType;
     struct IsctVertType;
     struct OrigVertType;
@@ -230,6 +240,18 @@ public:
         }
         return iv;
     }
+    // same, with the (exact) intersection coordinate already computed
+    IVptr addInteriorEndpoint(
+        IsctProblem *iprob, Eptr edge, GluePt glue, const Vec3d &coord
+    ) {
+        IVptr       iv              = iprob->newSplitIsctVert(coord, glue);
+                    iv->boundary    = false;
+                    iverts.push_back(iv);
+        for(Tptr tri_key : edge->tris) {
+                    addEdge(iprob, iv, tri_key);
+        }
+        return iv;
+    }
     // specify the other triangle cutting this one, the edge cut,
     // and the resulting point of intersection
     void addBoundaryEndpoint(
@@ -261,8 +283,13 @@ public:
     void addInteriorPoint(
         IsctProblem *iprob, Tptr t0, Tptr t1, GluePt glue
     ) {
-        // note this generates wasted re-computation of coordinates 3X
-        IVptr       iv              = iprob->newIsctVert(the_tri, t0, t1, glue);
+        addInteriorPoint(iprob, t0, t1, glue,
+                         iprob->computeCoords(the_tri, t0, t1));
+    }
+    void addInteriorPoint(
+        IsctProblem *iprob, Tptr t0, Tptr t1, GluePt glue, const Vec3d &coord
+    ) {
+        IVptr       iv              = iprob->newSplitIsctVert(coord, glue);
                     iv->boundary    = false;
                     iverts.push_back(iv);
         // find the 2 interior edges
@@ -330,38 +357,27 @@ public:
         return true;
     }
     
-    void subdivide(IsctProblem *iprob) {
+    // Subdivision is split in three phases so that the expensive middle
+    // one (constrained Delaunay triangulation) can run in parallel:
+    //   prepare  (serial)   -- gathers points, splits edges (pool allocs)
+    //   triangulate (parallel) -- pure function of SubdivData, no shared state
+    //   finish   (serial)   -- creates generic triangles (pool allocs)
+    struct SubdivData {
+        ShortVec<GVptr, 7>  points;
+        ShortVec<GEptr, 8>  edges;
+        uint                dim0 = 0, dim1 = 1;
+        double              sign_flip = 1.0;
+        std::vector<int>    tris;   // 3 indices per output triangle
+    };
+
+    void subdivide_prepare(IsctProblem *iprob, SubdivData &d) {
         // collect all the points, and create more points as necessary
-        ShortVec<GVptr, 7> points;
+        ShortVec<GVptr, 7> &points = d.points;
         for(uint k=0; k<3; k++) {
             points.push_back(overts[k]);
-            //std::cout << k << ": id " << overts[k]->concrete->ref << std::endl;
         }
         for(IVptr iv : iverts) {
-            //iprob->buildConcreteVert(iv);
             points.push_back(iv);
-            /*std::cout << "  " << points.size() - 1
-                          << " (" << iv->glue_marker->edge_tri_type
-                          << ") ";
-            if(iv->glue_marker->edge_tri_type) {
-                Eptr e = iv->glue_marker->e;
-                Vec3d p0 = iprob->vPos(e->verts[0]);
-                Vec3d p1 = iprob->vPos(e->verts[1]);
-                std::cout << " "
-                          << e->verts[0]->ref << p0
-                          << "  " << e->verts[1]->ref << p1;
-                
-                Tptr t = iv->glue_marker->t[0];
-                p0 = iprob->vPos(t->verts[0]);
-                p1 = iprob->vPos(t->verts[1]);
-                Vec3d p2 = iprob->vPos(t->verts[2]);
-                std::cout << "        "
-                          << t->verts[0]->ref << p0
-                          << "  " << t->verts[1]->ref << p1
-                          << "  " << t->verts[2]->ref << p2;
-            }
-            std::cout
-                          << std::endl;*/
         }
         for(uint i=0; i<points.size(); i++)
             points[i]->idx = i;
@@ -369,32 +385,12 @@ public:
         // split edges and marshall data
         // for safety, we zero out references to pre-subdivided edges,
         // which may have been destroyed
-        ShortVec<GEptr, 8> edges;
+        ShortVec<GEptr, 8> &edges = d.edges;
         for(uint k=0; k<3; k++) {
-            //std::cout << "oedge:  "
-            //          << oedges[k]->ends[0]->idx << "; "
-            //          << oedges[k]->ends[1]->idx << std::endl;
-            //for(IVptr iv : oedges[k]->interior)
-            //    std::cout << "  " << iv->idx << std::endl;
             subdivideEdge(iprob, oedges[k], edges);
             oedges[k]       = nullptr;
         }
-        //std::cout << "THE TRI: " << the_tri->verts[0]->ref
-        //          << "; " << the_tri->verts[1]->ref
-        //          << "; " << the_tri->verts[2]->ref
-        //          << std::endl;
         for(IEptr &ie : iedges) {
-            //std::cout << "iedge:  "
-            //          << ie->ends[0]->idx << "; "
-            //          << ie->ends[1]->idx << std::endl;
-            //std::cout << "other tri: " << ie->other_tri_key->verts[0]->ref
-            //          << "; " << ie->other_tri_key->verts[1]->ref
-            //          << "; " << ie->other_tri_key->verts[2]->ref
-            //          << std::endl;
-            //for(IVptr iv : ie->interior)
-            //    std::cout << "  " << iv->idx 
-            //              << " (" << iv->glue_marker->edge_tri_type
-            //              << ") " << std::endl;
             subdivideEdge(iprob, ie, edges);
             ie              = nullptr;
         }
@@ -406,21 +402,25 @@ public:
         Vec3d normal = cross( overts[1]->coord - overts[0]->coord,
                               overts[2]->coord - overts[0]->coord );
         uint normdim = maxDim(abs(normal));
-        uint dim0 = (normdim+1)%3;
-        uint dim1 = (normdim+2)%3;
-        double sign_flip = (normal.v[normdim] < 0.0)? -1.0 : 1.0;
-        
+        d.dim0 = (normdim+1)%3;
+        d.dim1 = (normdim+2)%3;
+        d.sign_flip = (normal.v[normdim] < 0.0)? -1.0 : 1.0;
+    }
+
+    static void subdivide_triangulate(SubdivData &d) {
+        const ShortVec<GVptr, 7> &points = d.points;
+        const ShortVec<GEptr, 8> &edges  = d.edges;
         struct triangulateio in, out;
         
         /* Define input points. */
         in.numberofpoints           = points.size();
         in.numberofpointattributes  = 0;
-        in.pointlist                = new double[in.numberofpoints * 2];
+        in.pointlist                = (double*)malloc(sizeof(double) * in.numberofpoints * 2);
         in.pointattributelist       = nullptr;
-        in.pointmarkerlist          = new int[in.numberofpoints];
+        in.pointmarkerlist          = (int*)malloc(sizeof(int) * in.numberofpoints);
         for(int k=0; k<in.numberofpoints; k++) {
-            in.pointlist[k*2 + 0] = points[k]->coord.v[dim0];
-            in.pointlist[k*2 + 1] = points[k]->coord.v[dim1] * sign_flip;
+            in.pointlist[k*2 + 0] = points[k]->coord.v[d.dim0];
+            in.pointlist[k*2 + 1] = points[k]->coord.v[d.dim1] * d.sign_flip;
             in.pointmarkerlist[k] = (points[k]->boundary)? 1 : 0;
         }
         
@@ -428,8 +428,8 @@ public:
         in.numberofsegments = edges.size();
         in.numberofholes = 0;// yes, zero
         in.numberofregions = 0;// not using regions
-        in.segmentlist = new int[in.numberofsegments * 2];
-        in.segmentmarkerlist = new int[in.numberofsegments];
+        in.segmentlist = (int*)malloc(sizeof(int) * in.numberofsegments * 2);
+        in.segmentmarkerlist = (int*)malloc(sizeof(int) * in.numberofsegments);
         for(int k=0; k<in.numberofsegments; k++) {
             in.segmentlist[k*2 + 0] = edges[k]->ends[0]->idx;
             in.segmentlist[k*2 + 1] = edges[k]->ends[1]->idx;
@@ -445,17 +445,11 @@ public:
         out.pointattributelist = nullptr; // not necessary if using -N or 0 attr
         out.pointmarkerlist = nullptr;
         out.trianglelist = nullptr; // not necessary if using -E
-        //out.triangleattributelist = null; // not necessary if using -E or 0 attr
-        //out.trianglearealist = // only needed with -r and -a
-        //out.neighborlist = null; // only neccesary if -n is used
         out.segmentlist = nullptr; // NEED THIS; output segments go here
         out.segmentmarkerlist = nullptr; // NEED THIS for OUTPUT SEGMENTS
-        //out.edgelist = null; // only necessary if -e is used
-        //out.edgemarkerlist = null; // only necessary if -e is used
                 
         // solve the triangulation problem
         char *params = (char*)("pzQYY");
-        //char *debug_params = (char*)("pzYYVC");
         triangulate(params, &in, &out, nullptr);
         
         if(out.numberofpoints != in.numberofpoints) {
@@ -487,40 +481,37 @@ public:
         }
         ENSURE(out.numberofpoints == in.numberofpoints);
         
-        //std::cout << "number of points in: " << in.numberofpoints
-        //          << std::endl;
-        //std::cout << "number of edges in: " << in.numberofsegments
-        //          << std::endl;
-        //std::cout << "number of triangles out: " << out.numberoftriangles
-        //          << std::endl;
-        
-        gtris.resize(out.numberoftriangles);
-        for(int k=0; k<out.numberoftriangles; k++) {
-            GVptr       gv0         = points[out.trianglelist[(k*3)+0]];
-            GVptr       gv1         = points[out.trianglelist[(k*3)+1]];
-            GVptr       gv2         = points[out.trianglelist[(k*3)+2]];
-                        gtris[k]    = iprob->newGenericTri(gv0, gv1, gv2);
-        }
-        
+        d.tris.assign(out.trianglelist, out.trianglelist + 3*out.numberoftriangles);
         
         // clean up after triangulate...
-            // in free
         free(in.pointlist);
         free(in.pointmarkerlist);
         free(in.segmentlist);
         free(in.segmentmarkerlist);
-            // out free
         free(out.pointlist);
-        //free(out.pointattributelist);
         free(out.pointmarkerlist);
         free(out.trianglelist);
-        //free(out.triangleattributelist);
-        //free(out.trianglearealist);
-        //free(out.neighborlist);
         free(out.segmentlist);
         free(out.segmentmarkerlist);
-        //free(out.edgelist);
-        //free(out.edgemarkerlist);
+    }
+
+    void subdivide_finish(IsctProblem *iprob, SubdivData &d) {
+        const ShortVec<GVptr, 7> &points = d.points;
+        const uint ntri = (uint)(d.tris.size() / 3);
+        gtris.resize(ntri);
+        for(uint k=0; k<ntri; k++) {
+            GVptr       gv0         = points[d.tris[(k*3)+0]];
+            GVptr       gv1         = points[d.tris[(k*3)+1]];
+            GVptr       gv2         = points[d.tris[(k*3)+2]];
+                        gtris[k]    = iprob->newGenericTri(gv0, gv1, gv2);
+        }
+    }
+
+    void subdivide(IsctProblem *iprob) {
+        SubdivData d;
+        subdivide_prepare(iprob, d);
+        subdivide_triangulate(d);
+        subdivide_finish(iprob, d);
     }
 
 private:
@@ -600,12 +591,9 @@ template<class VertData, class TriData>
 class Mesh<VertData,TriData>::IsctProblem : public TopoCache
 {
 public:
-    IsctProblem(Mesh *owner) : TopoCache(owner)
+    IsctProblem(Mesh *owner) : TopoCache(owner, /*vertEdges=*/false)
     {
-        // initialize all the triangles to NOT have an associated tprob
-        TopoCache::tris.for_each([](Tptr t) {
-            t->data = nullptr;
-        });
+        // (TopoCache::init already leaves every t->data == nullptr)
         
         // Callibrate the quantization unit...
         double maxMag = 0.0;
@@ -615,24 +603,36 @@ public:
         quantization::calibrate(maxMag);
         
         // and use vertex auxiliary data to store quantized vertex coordinates
-        uint N = TopoCache::mesh->verts.size();
-        quantized_coords.resize(N);
-        uint write = 0;
-        TopoCache::verts.for_each([&](Vptr v) {
-#ifdef _WIN32
-            Vec3d raw = mesh->verts[v->ref].pos;
-#else
-            Vec3d raw = TopoCache::mesh->verts[v->ref].pos;
-#endif
-            quantized_coords[write].x = quantization::quantize(raw.x);
-            quantized_coords[write].y = quantization::quantize(raw.y);
-            quantized_coords[write].z = quantization::quantize(raw.z);
-            v->data = &(quantized_coords[write]);
-            write++;
+        std::vector<Vptr> vv;
+        TopoCache::verts.collect(vv);
+        quantized_coords.resize(vv.size());
+        Mesh *m = TopoCache::mesh;
+        cork_par::for_each_idx(vv.size(), 8192, [&](size_t i) {
+            Vptr v = vv[i];
+            Vec3d raw = m->verts[v->ref].pos;
+            quantized_coords[i].x = quantization::quantize(raw.x);
+            quantized_coords[i].y = quantization::quantize(raw.y);
+            quantized_coords[i].z = quantization::quantize(raw.z);
+            v->data = &(quantized_coords[i]);
         });
     }
     
-    virtual ~IsctProblem() {}
+    virtual ~IsctProblem() {
+        // Tear the pools down concurrently (each pool touches only its own
+        // memory; ShortVec storage is inline / per-object heap).
+        cork_par::invoke(
+            [&] { glue_pts.release(); },
+            [&] { tprobs.release(); },
+            [&] { ivpool.release(); },
+            [&] { ovpool.release(); },
+            [&] { iepool.release(); },
+            [&] { oepool.release(); },
+            [&] { sepool.release(); },
+            [&] { gtpool.release(); },
+            [&] { TopoCache::verts.release(); },
+            [&] { TopoCache::edges.release(); });
+        TopoCache::tris.release();
+    }
     
     // access auxiliary quantized coordinates
     inline Vec3d vPos(Vptr v) const {
@@ -840,8 +840,10 @@ private:
     bool checkIsct(Eptr e, Tptr t) const;
     bool checkIsct(Tptr t0, Tptr t1, Tptr t2) const;
     
+public:
     Vec3d computeCoords(Eptr e, Tptr t) const;
     Vec3d computeCoords(Tptr t0, Tptr t1, Tptr t2) const;
+private:
     
     void fillOutVertData(GluePt glue, VertData &data);
     void fillOutTriData(Tptr tri, Tptr parent);
@@ -851,6 +853,7 @@ private:
 private: // functions here to get around a GCC bug...
     void createRealPtFromGluePt(GluePt glue);
     void createRealTriangles(Tprob tprob, EdgeCache &ecache);
+    long long crt_ns[4] = {0,0,0,0};
 };
 
 template<class T, uint LEN> inline
@@ -902,99 +905,510 @@ void Mesh<VertData,TriData>::IsctProblem::bvh_edge_tri(
     std::function<bool(Eptr e, Tptr t)> func
 ) {
     std::vector< GeomBlob<Eptr> > edge_geoms;
+    edge_geoms.reserve(TopoCache::edges.size());
     TopoCache::edges.for_each([&](Eptr e) {
         edge_geoms.push_back(edge_blob(e));
     });
     AABVH<Eptr> edgeBVH(edge_geoms);
-    
-    // use the acceleration structure
+
     bool aborted = false;
     TopoCache::tris.for_each([&](Tptr t) {
-        // compute BBox
+        if(aborted) return;
         BBox3d bbox = buildBox(t);
-        if(!aborted) {
-            edgeBVH.for_each_in_box(bbox, [&](Eptr e) {
-                if(!func(e,t))
-                    aborted = true;
-            });
-        }
+        edgeBVH.for_each_in_box(bbox, [&](Eptr e) {
+            if(aborted) return;
+            if(!func(e, t))
+                aborted = true;
+        });
     });
 }
+
+// ---------------------------------------------------------------------------
+// Broad phase: fine uniform cells, sorted entries, merge join.
+//
+// A dense 3D grid is a poor fit for a triangle *surface* (2D data in 3D):
+// almost all cells are empty while the few occupied ones are packed.  Here
+// we choose a cell size on the order of an edge, bin every edge and every
+// triangle into the cells its bbox touches, sort the (cell, prim) entries and
+// merge-join the two sorted streams.  A pair is tested in exactly one cell
+// (the cell containing the lower corner of the two boxes' intersection), so
+// no de-duplication is needed.  The set of pairs that reach the exact test
+// is exactly the set of edge/tri pairs with overlapping boxes -- identical to
+// what the original BVH traversal produced.
+// ---------------------------------------------------------------------------
+namespace cork_si {
+
+// Scratch array without value-initialisation: std::vector<T>(n) zero-fills
+// (or default-constructs) hundreds of MB serially here; every element is
+// written by a parallel loop before it is read, so skip that.
+template<class T>
+struct RawArray {
+    T *p = nullptr; size_t n = 0;
+    RawArray() {}
+    explicit RawArray(size_t n_) { alloc(n_); }
+    RawArray(const RawArray&) = delete;
+    RawArray &operator=(const RawArray&) = delete;
+    ~RawArray() { release(); }
+    void alloc(size_t n_) {
+        release(); n = n_;
+        p = static_cast<T*>(::operator new(sizeof(T) * (n_ ? n_ : 1)));
+    }
+    void release() { if (p) ::operator delete(p); p = nullptr; n = 0; }
+    inline T &operator[](size_t i)             { return p[i]; }
+    inline const T &operator[](size_t i) const { return p[i]; }
+    size_t size() const { return n; }
+    T *data() { return p; }
+    const T *data() const { return p; }
+    T *begin() { return p; }  T *end() { return p + n; }
+    const T *begin() const { return p; }  const T *end() const { return p + n; }
+};
+
+struct CellGrid {
+    Vec3d   org;
+    Vec3d   inv;
+    int     nx = 1, ny = 1, nz = 1;
+
+    inline void cellOf(const Vec3d &p, int &x, int &y, int &z) const {
+        x = (int)std::floor((p.x - org.x) * inv.x);
+        y = (int)std::floor((p.y - org.y) * inv.y);
+        z = (int)std::floor((p.z - org.z) * inv.z);
+        x = x < 0 ? 0 : (x >= nx ? nx - 1 : x);
+        y = y < 0 ? 0 : (y >= ny ? ny - 1 : y);
+        z = z < 0 ? 0 : (z >= nz ? nz - 1 : z);
+    }
+    inline uint32_t key(int x, int y, int z) const {
+        return (uint32_t)(((uint64_t)z * (uint64_t)ny + (uint64_t)y) * (uint64_t)nx + (uint64_t)x);
+    }
+    inline uint32_t ownerKey(const BBox3d &a, const BBox3d &b) const {
+        Vec3d L = max(a.minp, b.minp);
+        int x, y, z;
+        cellOf(L, x, y, z);
+        return key(x, y, z);
+    }
+};
+
+inline uint32_t entryKey(uint64_t e) { return (uint32_t)(e >> 32); }
+inline uint32_t entryIdx(uint64_t e) { return (uint32_t)(e & 0xffffffffu); }
+
+// sorted (cell<<32 | prim) entries for a set of boxes
+template<class BoxArray>
+inline void buildEntries(const CellGrid &g, const BoxArray &boxes,
+                         RawArray<uint64_t> &out)
+{
+    const size_t n = boxes.size();
+    RawArray<uint32_t> cnt(n + 1);
+    cnt[0] = 0;
+    cork_par::for_each_idx(n, 4096, [&](size_t i) {
+        int a[3], b[3];
+        g.cellOf(boxes[i].minp, a[0], a[1], a[2]);
+        g.cellOf(boxes[i].maxp, b[0], b[1], b[2]);
+        cnt[i + 1] = (uint32_t)((b[0]-a[0]+1) * (b[1]-a[1]+1) * (b[2]-a[2]+1));
+    });
+    for (size_t i = 0; i < n; ++i) cnt[i + 1] += cnt[i];
+    out.alloc(cnt[n]);
+    cork_par::for_each_idx(n, 4096, [&](size_t i) {
+        int a[3], b[3];
+        g.cellOf(boxes[i].minp, a[0], a[1], a[2]);
+        g.cellOf(boxes[i].maxp, b[0], b[1], b[2]);
+        size_t w = cnt[i];
+        for (int z = a[2]; z <= b[2]; ++z)
+            for (int y = a[1]; y <= b[1]; ++y)
+                for (int x = a[0]; x <= b[0]; ++x)
+                    out[w++] = ((uint64_t)g.key(x, y, z) << 32) | (uint64_t)i;
+    });
+    cork_par::sort(out.begin(), out.end());
+}
+
+// chunk the sorted tri entries without splitting a cell run
+inline void chunkRuns(const RawArray<uint64_t> &ent, size_t chunk,
+                      std::vector<size_t> &starts)
+{
+    starts.clear();
+    starts.push_back(0);
+    const size_t n = ent.size();
+    for (size_t s = chunk; s < n; s += chunk) {
+        size_t i = s;
+        while (i < n && entryKey(ent[i]) == entryKey(ent[i - 1])) ++i;
+        if (i < n && i > starts.back()) starts.push_back(i);
+    }
+    starts.push_back(n);
+}
+
+struct EdgeTriHit {
+    uint32_t ti, ei;
+    Vec3d    coord;
+};
+
+// float box rounded outward: overlap test on these is conservative w.r.t.
+// the exact double test, which is still applied to every pair that passes.
+struct BoxF { float mnx, mny, mnz, mxx, mxy, mxz; };
+inline float fdown(double v) { float f = (float)v; return ((double)f > v) ? std::nextafter(f, -INFINITY) : f; }
+inline float fup(double v)   { float f = (float)v; return ((double)f < v) ? std::nextafter(f,  INFINITY) : f; }
+inline BoxF toBoxF(const BBox3d &b) {
+    BoxF f;
+    f.mnx = fdown(b.minp.x); f.mny = fdown(b.minp.y); f.mnz = fdown(b.minp.z);
+    f.mxx = fup(b.maxp.x);   f.mxy = fup(b.maxp.y);   f.mxz = fup(b.maxp.z);
+    return f;
+}
+inline bool overlapF(const BoxF &a, const BoxF &b) {
+    return a.mnx <= b.mxx && b.mnx <= a.mxx &&
+           a.mny <= b.mxy && b.mny <= a.mxy &&
+           a.mnz <= b.mxz && b.mnz <= a.mxz;
+}
+
+// Structure-of-arrays float boxes with an AVX2 range query.
+struct BoxSoA {
+    RawArray<float> mnx, mny, mnz, mxx, mxy, mxz;
+    void resize(size_t n) {
+        // +8 padding so the vector tail can be loaded unconditionally;
+        // only the padding is initialised here (to never-matching boxes)
+        RawArray<float> *all[6] = { &mnx, &mny, &mnz, &mxx, &mxy, &mxz };
+        for (int k = 0; k < 6; ++k) {
+            all[k]->alloc(n + 8);
+            for (size_t i = n; i < n + 8; ++i) (*all[k])[i] = (k < 3) ? INFINITY : -INFINITY;
+        }
+    }
+    inline void set(size_t i, const BoxF &b) {
+        mnx[i] = b.mnx; mny[i] = b.mny; mnz[i] = b.mnz;
+        mxx[i] = b.mxx; mxy[i] = b.mxy; mxz[i] = b.mxz;
+    }
+    // indices in [b0,b1) whose box overlaps q -> out ; returns count
+    inline int overlaps(const BoxF &q, size_t b0, size_t b1, std::vector<size_t> &out) const {
+        if (out.size() < (b1 - b0) + 8) out.resize((b1 - b0) + 8);
+        int w = 0;
+#if defined(__AVX2__) || defined(_MSC_VER)
+        const __m256 qmnx = _mm256_set1_ps(q.mnx), qmny = _mm256_set1_ps(q.mny), qmnz = _mm256_set1_ps(q.mnz);
+        const __m256 qmxx = _mm256_set1_ps(q.mxx), qmxy = _mm256_set1_ps(q.mxy), qmxz = _mm256_set1_ps(q.mxz);
+        size_t b = b0;
+        for (; b < b1; b += 8) {
+            __m256 ok = _mm256_cmp_ps(qmnx, _mm256_loadu_ps(&mxx[b]), _CMP_LE_OQ);
+            ok = _mm256_and_ps(ok, _mm256_cmp_ps(_mm256_loadu_ps(&mnx[b]), qmxx, _CMP_LE_OQ));
+            ok = _mm256_and_ps(ok, _mm256_cmp_ps(qmny, _mm256_loadu_ps(&mxy[b]), _CMP_LE_OQ));
+            ok = _mm256_and_ps(ok, _mm256_cmp_ps(_mm256_loadu_ps(&mny[b]), qmxy, _CMP_LE_OQ));
+            ok = _mm256_and_ps(ok, _mm256_cmp_ps(qmnz, _mm256_loadu_ps(&mxz[b]), _CMP_LE_OQ));
+            ok = _mm256_and_ps(ok, _mm256_cmp_ps(_mm256_loadu_ps(&mnz[b]), qmxz, _CMP_LE_OQ));
+            unsigned mask = (unsigned)_mm256_movemask_ps(ok);
+            // lanes past b1 read padding (inf boxes) and never match
+            while (mask) {
+                unsigned long bit;
+#if defined(_MSC_VER)
+                _BitScanForward(&bit, mask);
+#else
+                bit = (unsigned long)__builtin_ctz(mask);
+#endif
+                size_t idx = b + bit;
+                if (idx < b1) out[w++] = idx;
+                mask &= mask - 1;
+            }
+        }
+#else
+        for (size_t b = b0; b < b1; ++b) {
+            if (q.mnx <= mxx[b] && mnx[b] <= q.mxx &&
+                q.mny <= mxy[b] && mny[b] <= q.mxy &&
+                q.mnz <= mxz[b] && mnz[b] <= q.mxz) out[w++] = b;
+        }
+#endif
+        return w;
+    }
+};
+
+} // namespace cork_si
 
 template<class VertData, class TriData>
 bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
 {
+    using namespace cork_si;
     empty3d::degeneracy_count = 0;
-    // Find all edge-triangle intersection points
-    //for_edge_tri([&](Eptr eisct, Tptr tisct)->bool{
-    bvh_edge_tri([&](Eptr eisct, Tptr tisct)->bool{
-      if(checkIsct(eisct,tisct)) {
-        GluePt      glue                    = newGluePt();
-                    glue->edge_tri_type     = true;
-                    glue->e                 = eisct;
-                    glue->t[0]              = tisct;
-        // first add point and edges to the pierced triangle
-        IVptr iv = getTprob(tisct)->addInteriorEndpoint(this, eisct, glue);
-        for(Tptr tri : eisct->tris) {
-            getTprob(tri)->addBoundaryEndpoint(this, tisct, eisct, iv);
-        }
-      }
-      if(empty3d::degeneracy_count > 0)
-        return false; // break
-      else
-        return true; // continue
-    });
-    if(empty3d::degeneracy_count > 0) {
-        return false;   // restart / abort
+    empty3d::exact_count = 0;
+
+    std::vector<Eptr> edges;
+    std::vector<Tptr> tris;
+    {
+        CORK_PROF("      collect edges/tris");
+        TopoCache::edges.collect(edges);
+        TopoCache::tris.collect(tris);
     }
-    
-    // we're going to peek into the triangle problems in order to
-    // identify potential candidates for Tri-Tri-Tri intersections
+    const size_t ne = edges.size();
+    const size_t nt = tris.size();
+    if (ne == 0 || nt == 0) return true;
+
+    // ---- boxes (parallel) + world bbox / mean edge extent (reduce) ----
+    RawArray<BBox3d> ebb(ne), tbb_(nt);
+    // flat copies of what the narrow phase needs (vertex ids + quantized
+    // positions) so the hot loop never chases Eptr/Tptr/Vptr pointers
+    struct EdgeRec { Vec3d p[2]; uint32_t v[2]; };
+    struct TriRec  { Vec3d p[3]; uint32_t v[3]; };
+    RawArray<EdgeRec> erec(ne);
+    RawArray<TriRec>  trec(nt);
+    const Vec3d *qbase = quantized_coords.data();
+    BBox3d world;
+    double meanExt = 0.0;
+    {
+        CORK_PROF("      boxes");
+        struct Acc { BBox3d box; double sum = 0.0; };
+        cork_par::Local<Acc> acc;
+        cork_par::for_range(ne, 8192, [&](size_t b, size_t e) {
+            Acc &a = acc.local();
+            for (size_t i = b; i < e; ++i) {
+                ebb[i] = buildBox(edges[i]);
+                a.box = convex(a.box, ebb[i]);
+                Vec3d d = ebb[i].maxp - ebb[i].minp;
+                a.sum += std::max(d.x, std::max(d.y, d.z));
+                for (int k = 0; k < 2; ++k) {
+                    const Vec3d *q = (const Vec3d*)edges[i]->verts[k]->data;
+                    erec[i].p[k] = *q; erec[i].v[k] = (uint32_t)(q - qbase);
+                }
+            }
+        });
+        acc.combine_each([&](const Acc &a) { world = convex(world, a.box); meanExt += a.sum; });
+        meanExt /= (double)ne;
+        cork_par::for_each_idx(nt, 8192, [&](size_t i) {
+            tbb_[i] = buildBox(tris[i]);
+            for (int k = 0; k < 3; ++k) {
+                const Vec3d *q = (const Vec3d*)tris[i]->verts[k]->data;
+                trec[i].p[k] = *q; trec[i].v[k] = (uint32_t)(q - qbase);
+            }
+        });
+    }
+
+    // ---- cell grid ----
+    CellGrid grid;
+    {
+        Vec3d ext = world.maxp - world.minp;
+        double cellFactor = 3.0;   // cells ~3x mean edge extent (measured best)
+        if (const char *cf = std::getenv("CORK_CELL_FACTOR")) cellFactor = std::atof(cf);
+        double h = cellFactor * meanExt;
+        double maxExt = std::max(ext.x, std::max(ext.y, ext.z));
+        if (!(h > 0.0)) h = (maxExt > 0.0) ? maxExt : 1.0;
+        for (;;) {
+            long long nx = std::max(1LL, std::min(1LL << 20, (long long)std::ceil(ext.x / h)));
+            long long ny = std::max(1LL, std::min(1LL << 20, (long long)std::ceil(ext.y / h)));
+            long long nz = std::max(1LL, std::min(1LL << 20, (long long)std::ceil(ext.z / h)));
+            if (nx * ny * nz < (1LL << 32)) { grid.nx = (int)nx; grid.ny = (int)ny; grid.nz = (int)nz; break; }
+            h *= 1.5;
+        }
+        double pad = 1e-9 * std::max(maxExt, 1.0);
+        grid.org = world.minp - Vec3d(pad, pad, pad);
+        grid.inv = Vec3d(1.0 / h, 1.0 / h, 1.0 / h);
+        cork_prof::note("      grid nx", (double)grid.nx);
+        cork_prof::note("      grid ny", (double)grid.ny);
+        cork_prof::note("      grid nz", (double)grid.nz);
+    }
+
+    RawArray<uint64_t> eent, tent;
+    {
+        CORK_PROF("      bin + sort entries");
+        cork_par::invoke([&] { buildEntries(grid, ebb, eent); },
+                         [&] { buildEntries(grid, tbb_, tent); });
+        cork_prof::note("      #edge entries", (double)eent.size());
+        cork_prof::note("      #tri entries", (double)tent.size());
+    }
+    // edge boxes in sorted-entry order: the inner join loop then streams
+    // through contiguous memory instead of gathering random 48 byte boxes
+    // edge boxes in sorted-entry order as SoA floats (rounded outward), so the
+    // join streams contiguous memory and tests 8 edges per AVX2 instruction
+    BoxSoA esoa;
+    RawArray<uint32_t> evid0(eent.size()), evid1(eent.size());
+    {
+        CORK_PROF("      stream boxes (SoA)");
+        esoa.resize(eent.size());
+        cork_par::for_each_idx(eent.size(), 16384, [&](size_t b) {
+            uint32_t ei = entryIdx(eent[b]);
+            esoa.set(b, toBoxF(ebb[ei]));
+            evid0[b] = erec[ei].v[0];
+            evid1[b] = erec[ei].v[1];
+        });
+    }
+
+    // ---- merge join + narrow phase + exact coordinates (parallel) ----
+    std::vector<EdgeTriHit> hits;
+    int any_degen = 0;
+    {
+        CORK_PROF("      parallel edge-tri SI");
+        std::vector<size_t> starts;
+        chunkRuns(tent, 2048, starts);
+        const size_t nchunks = starts.size() - 1;
+        const size_t NE = eent.size();
+
+        cork_par::Local<std::vector<EdgeTriHit>> tls_hits;
+        cork_par::Local<int> tls_degen([] { return 0; });
+        cork_par::Local<std::array<long long, 9>> tls_cnt([] { return std::array<long long, 9>{0, 0, 0, 0, 0, 0, 0, 0, 0}; });
+        const bool verify_coords = std::getenv("CORK_VERIFY_COORDS") != nullptr;
+
+        cork_par::Local<std::vector<size_t>> tls_cand;
+        cork_par::for_range(nchunks, 1, [&](size_t cb, size_t ce) {
+            auto &local_hits = tls_hits.local();
+            auto &cnt = tls_cnt.local();
+            auto &cand = tls_cand.local();
+            auto chunk_t0 = std::chrono::steady_clock::now();
+            empty3d::degeneracy_count = 0;
+            empty3d::exact_count = 0;
+            for (size_t c = cb; c < ce; ++c) {
+                size_t i = starts[c], end = starts[c + 1];
+                if (i >= end) continue;
+                uint32_t k0 = entryKey(tent[i]);
+                size_t ep = (size_t)(std::lower_bound(eent.begin(), eent.end(), (uint64_t)k0 << 32) - eent.begin());
+                while (i < end) {
+                    uint32_t k = entryKey(tent[i]);
+                    size_t j = i + 1;
+                    while (j < end && entryKey(tent[j]) == k) ++j;
+                    while (ep < NE && entryKey(eent[ep]) < k) ++ep;
+                    if (ep < NE && entryKey(eent[ep]) == k) {
+                        size_t eq = ep + 1;
+                        while (eq < NE && entryKey(eent[eq]) == k) ++eq;
+                        for (size_t a = i; a < j; ++a) {
+                            uint32_t ti = entryIdx(tent[a]);
+                            const BBox3d &tb = tbb_[ti];
+                            const BoxF tbf = toBoxF(tb);
+                            const TriRec &tr = trec[ti];
+                            empty3d::TriEdgeIn input;
+                            input.tri.p[0] = tr.p[0]; input.tri.p[1] = tr.p[1]; input.tri.p[2] = tr.p[2];
+                            cnt[5] += (long long)(eq - ep);
+                            // AVX2: candidate bitmask over the cell's edge entries
+                            int ncand = esoa.overlaps(tbf, ep, eq, cand);
+                            cnt[7] += ncand;
+                            for (int ci = 0; ci < ncand; ++ci) {
+                                size_t b = cand[ci];
+                                // most candidates are edges touching the triangle:
+                                // reject them from the streamed vertex ids first
+                                const uint32_t ev0 = evid0[b], ev1 = evid1[b];
+                                if (ev0 == tr.v[0] || ev0 == tr.v[1] || ev0 == tr.v[2] ||
+                                    ev1 == tr.v[0] || ev1 == tr.v[1] || ev1 == tr.v[2]) continue;
+                                uint32_t ei = entryIdx(eent[b]);
+                                const BBox3d &eb = ebb[ei];
+                                if (!hasIsct(tb, eb)) continue;
+                                if (grid.ownerKey(tb, eb) != k) continue;
+                                const EdgeRec &er = erec[ei];
+                                cnt[0]++;
+                                input.edge.p[0] = er.p[0]; input.edge.p[1] = er.p[1];
+                                if (!empty3d::emptyExact(input)) {
+                                    EdgeTriHit h;
+                                    h.ti = ti; h.ei = ei;
+                                    auto c0 = std::chrono::steady_clock::now();
+                                    h.coord = empty3d::coordsExact(input);
+                                    cnt[2] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - c0).count();
+                                    if (verify_coords) {
+                                        Vec3d g = empty3d::coordsExactGmp(input);
+                                        if (g.x != h.coord.x || g.y != h.coord.y || g.z != h.coord.z)
+                                            cnt[3]++;
+                                    }
+                                    local_hits.push_back(h);
+                                }
+                            }
+                        }
+                        ep = eq;
+                    }
+                    i = j;
+                }
+            }
+            tls_degen.local() += empty3d::degeneracy_count;
+            cnt[1] += empty3d::exact_count;
+            cnt[4] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - chunk_t0).count();
+            empty3d::degeneracy_count = 0;
+            empty3d::exact_count = 0;
+        });
+
+        tls_hits.combine_each([&](std::vector<EdgeTriHit> &v) { hits.insert(hits.end(), v.begin(), v.end()); });
+        tls_degen.combine_each([&](int d) { any_degen += d; });
+        long long tot[9] = {0,0,0,0,0,0,0,0,0};
+        tls_cnt.combine_each([&](const std::array<long long, 9> &c) { for (int i=0;i<9;i++) tot[i] += c[i]; });
+        cork_prof::note("      #cell cross pairs", (double)tot[5]);
+        cork_prof::note("      #float-box candidates", (double)tot[7]);
+        cork_prof::note("      #filter calls (bbox pass)", (double)tot[0]);
+        cork_prof::note("      #exact fallbacks", (double)tot[1]);
+        cork_prof::note("      coords CPU ms (sum threads)", (double)tot[2] * 1e-6);
+        cork_prof::note("      SI busy CPU ms (sum threads)", (double)tot[4] * 1e-6);
+        if (verify_coords) cork_prof::note("      #coords != GMP reference", (double)tot[3]);
+        cork_prof::note("      #edge-tri hits", (double)hits.size());
+
+        // deterministic order for a given perturbation
+        cork_par::sort(hits.begin(), hits.end(), [](const EdgeTriHit &a, const EdgeTriHit &b) {
+            return a.ti < b.ti || (a.ti == b.ti && a.ei < b.ei);
+        });
+    }
+
+    if (any_degen > 0) {
+        empty3d::degeneracy_count = any_degen;
+        return false;
+    }
+    empty3d::degeneracy_count = 0;
+
+    {
+        CORK_PROF("      apply hits (glue pts)");
+        for (const EdgeTriHit &h : hits) {
+            Eptr eisct = edges[h.ei];
+            Tptr tisct = tris[h.ti];
+            GluePt glue = newGluePt();
+            glue->edge_tri_type = true;
+            glue->e = eisct;
+            glue->t[0] = tisct;
+            IVptr iv = getTprob(tisct)->addInteriorEndpoint(this, eisct, glue, h.coord);
+            for (Tptr tri : eisct->tris) {
+                getTprob(tri)->addBoundaryEndpoint(this, tisct, eisct, iv);
+            }
+        }
+    }
+
+    // ---- tri-tri-tri: collect (serial), test + coords (parallel), apply (serial) ----
+    CORK_PROF("      tri-tri-tri");
     std::vector<TriTripleTemp> triples;
     tprobs.for_each([&](Tprob tprob) {
         Tptr t0 = tprob->the_tri;
-        // Scan pairs of existing edges to create candidate triples
         for_pairs<IEptr,2>(tprob->iedges, [&](IEptr &ie1, IEptr &ie2){
             Tptr t1 = ie1->other_tri_key;
             Tptr t2 = ie2->other_tri_key;
-            // This triple might be considered three times,
-            // one for each triangle it contains.
-            // To prevent duplication, only proceed if this is
-            // the least triangle according to an arbitrary ordering
             if(t0 < t1 && t0 < t2) {
-                // now look for the third edge.  We're not
-                // sure if it exists...
                 Tprob prob1 = reinterpret_cast<Tprob>(t1->data);
                 for(IEptr ie : prob1->iedges) {
                     if(ie->other_tri_key == t2) {
-                        // ADD THE TRIPLE
                         triples.push_back(TriTripleTemp(t0, t1, t2));
                     }
                 }
             }
         });
     });
-    // Now, we've collected a list of Tri-Tri-Tri intersection candidates.
-    // Check to see if the intersections actually exist.
-    for(TriTripleTemp t : triples) {
-        if(!checkIsct(t.t0, t.t1, t.t2))    continue;
-        
-        // Abort if we encounter a degeneracy
-        if(empty3d::degeneracy_count > 0)   break;
-        
+    struct TripleRes { bool ok; Vec3d c0, c1, c2; };
+    std::vector<TripleRes> tres(triples.size());
+    int tri_degen = 0;
+    {
+        cork_par::Local<int> tls_degen([] { return 0; });
+        cork_par::for_range(triples.size(), 64, [&](size_t b, size_t e) {
+            empty3d::degeneracy_count = 0;
+            for (size_t i = b; i < e; ++i) {
+                const TriTripleTemp &t = triples[i];
+                TripleRes &r = tres[i];
+                r.ok = checkIsct(t.t0, t.t1, t.t2);
+                if (r.ok) {
+                    // same orderings as the three addInteriorPoint calls below
+                    r.c0 = computeCoords(t.t0, t.t1, t.t2);
+                    r.c1 = computeCoords(t.t1, t.t0, t.t2);
+                    r.c2 = computeCoords(t.t2, t.t0, t.t1);
+                }
+            }
+            tls_degen.local() += empty3d::degeneracy_count;
+            empty3d::degeneracy_count = 0;
+        });
+        tls_degen.combine_each([&](int d) { tri_degen += d; });
+    }
+    if (tri_degen > 0) {
+        empty3d::degeneracy_count = tri_degen;
+        return false;
+    }
+    for (size_t i = 0; i < triples.size(); ++i) {
+        if (!tres[i].ok) continue;
+        const TriTripleTemp &t = triples[i];
         GluePt      glue                    = newGluePt();
                     glue->edge_tri_type     = false;
                     glue->t[0]              = t.t0;
                     glue->t[1]              = t.t1;
                     glue->t[2]              = t.t2;
-        getTprob(t.t0)->addInteriorPoint(this, t.t1, t.t2, glue);
-        getTprob(t.t1)->addInteriorPoint(this, t.t0, t.t2, glue);
-        getTprob(t.t2)->addInteriorPoint(this, t.t0, t.t1, glue);
+        getTprob(t.t0)->addInteriorPoint(this, t.t1, t.t2, glue, tres[i].c0);
+        getTprob(t.t1)->addInteriorPoint(this, t.t0, t.t2, glue, tres[i].c1);
+        getTprob(t.t2)->addInteriorPoint(this, t.t0, t.t1, glue, tres[i].c2);
     }
-    if(empty3d::degeneracy_count > 0) {
-        return false;   // restart / abort
-    }
-    
+
     return true;
 }
 
@@ -1036,9 +1450,18 @@ template<class VertData, class TriData>
 void Mesh<VertData,TriData>::IsctProblem::findIntersections()
 {
     int nTrys = 5;
-    perturbPositions(); // always perturb for safety...
+    {
+        CORK_PROF("    perturbPositions");
+        perturbPositions(); // always perturb for safety...
+    }
     while(nTrys > 0) {
-        if(!tryToFindIntersections()) {
+        bool ok;
+        {
+            CORK_PROF("    tryToFindIntersections");
+            ok = tryToFindIntersections();
+        }
+        if(!ok) {
+            CORK_PROF("    reset+perturb (retry)");
             reset();
             perturbPositions();
             nTrys--;
@@ -1055,6 +1478,8 @@ void Mesh<VertData,TriData>::IsctProblem::findIntersections()
     // all triangle problems assembled.
     // Some intersection edges may have original vertices as endpoints
     // we consolidate the problems to check for cases like these.
+    CORK_PROF("    consolidate");
+    cork_prof::note("    #tprobs", (double)tprobs.size());
     tprobs.for_each([&](Tprob tprob) {
         tprob->consolidate(this);
     });
@@ -1139,21 +1564,17 @@ void Mesh<VertData,TriData>::IsctProblem::marshallArithmeticInput(
 template<class VertData, class TriData>
 bool Mesh<VertData,TriData>::IsctProblem::checkIsct(Eptr e, Tptr t) const
 {
-    // simple bounding box cull; for acceleration, not correctness
+    // BVH already tested boxes for most callers; keep a cheap reject for serial
     BBox3d      ebox        = buildBox(e);
     BBox3d      tbox        = buildBox(t);
     if(!hasIsct(ebox, tbox))
                 return      false;
-    
-    // must check whether the edge and triangle share a vertex
-    // if so, then trivially we know they intersect in exactly that vertex
-    // so we discard this case from consideration.
+
     if(hasCommonVert(e, t))
                 return      false;
-    
+
     empty3d::TriEdgeIn input;
     marshallArithmeticInput(input, e, t);
-    //bool empty = empty3d::isEmpty(input);
     bool empty = empty3d::emptyExact(input);
     return !empty;
 }
@@ -1261,29 +1682,36 @@ void Mesh<VertData,TriData>::IsctProblem::fillOutTriData(
 }
 
 
+// Open-addressing hash from (min ref, max ref) -> Eptr.
+// The original kept a ShortVec<_,8> per mesh vertex (~150 bytes each, so
+// ~100MB of zero-initialised memory for a 700k vertex mesh) even though only
+// the handful of vertices touched by intersections ever hold an entry.
 template<class VertData, class TriData>
 class Mesh<VertData,TriData>::IsctProblem::EdgeCache
 {
 public:
-    EdgeCache(IsctProblem *ip) : iprob(ip), edges(ip->mesh->verts.size()) {}
+    EdgeCache(IsctProblem *ip, uint expected = 1024) : iprob(ip) {
+        size_t cap = 16;
+        while(cap < (size_t)expected * 2) cap <<= 1;
+        keys.assign(cap, (uint64_t)EMPTY);
+        vals.assign(cap, nullptr);
+        mask = cap - 1;
+    }
     
     Eptr operator()(Vptr v0, Vptr v1) {
         uint i = v0->ref;
         uint j = v1->ref;
         if(i > j) std::swap(i,j);
-        
-        uint N = edges[i].size();
-        for(uint k=0; k<N; k++)
-            if(edges[i][k].vid == j)
-                return edges[i][k].e;
+        uint64_t key = ((uint64_t)i << 32) | (uint64_t)j;
+        size_t slot = find(key);
+        if(keys[slot] == key) return vals[slot];
         // if not existing, create it
-        edges[i].push_back(EdgeEntry(j));
-        Eptr e = edges[i][N].e = iprob->newEdge();
+        Eptr e = iprob->newEdge();
         e->verts[0] = v0;
         e->verts[1] = v1;
         v0->edges.push_back(e);
         v1->edges.push_back(e);
-        
+        insertAt(slot, key, e);
         return e;
     }
     
@@ -1296,27 +1724,23 @@ public:
         Vptr    v1              = gv1->concrete;
             // if neither of these are intersection points,
             // then this is a pre-existing edge...
-        Eptr    e               = nullptr;
-        if(typeid(gv0) == typeid(OVptr) &&
-           typeid(gv1) == typeid(OVptr)
-        ) {
-            // search through edges of original triangle...
-            for(uint c=0; c<3; c++) {
-                Vptr corner0 = big_tri->verts[(c+1)%3];
-                Vptr corner1 = big_tri->verts[(c+2)%3];
-                if((corner0 == v0 && corner1 == v1) ||
-                   (corner0 == v1 && corner1 == v0)) {
-                    e   = big_tri->edges[c];
-                }
+        // NOTE: upstream tested `typeid(gv0) == typeid(OVptr)`, which compares
+        // the *static* pointer types and is therefore always false, so every
+        // boundary edge was re-created through the cache (a duplicate edge
+        // between the same two vertices).  Output verts/tris are unaffected
+        // either way; we simply reuse the original edge when both endpoints
+        // are corners of the big triangle.  Falls through to the cache if
+        // the corner pair is somehow not one of its edges.
+        for(uint c=0; c<3; c++) {
+            Vptr corner0 = big_tri->verts[(c+1)%3];
+            Vptr corner1 = big_tri->verts[(c+2)%3];
+            if((corner0 == v0 && corner1 == v1) ||
+               (corner0 == v1 && corner1 == v0)) {
+                return big_tri->edges[c];
             }
-            ENSURE(e); // Yell if we didn't find an edge
         }
-            // otherwise, we need to check the cache to find this edge
-        else
-        {
-            e = operator()(v0, v1);
-        }
-        return e;
+        (void)gv0; (void)gv1;
+        return operator()(v0, v1);
     }
     
     Eptr maybeEdge(GEptr ge)
@@ -1324,26 +1748,49 @@ public:
         uint i = ge->ends[0]->concrete->ref;
         uint j = ge->ends[1]->concrete->ref;
         if(i > j) std::swap(i,j);
-        
-        uint N = edges[i].size();
-        for(uint k=0; k<N; k++)
-            if(edges[i][k].vid == j)
-                return edges[i][k].e;
-        // if we can't find it
-        return nullptr;
+        uint64_t key = ((uint64_t)i << 32) | (uint64_t)j;
+        size_t slot = find(key);
+        return (keys[slot] == key) ? vals[slot] : nullptr;
     }
     
 private:
-    struct EdgeEntry {
-        EdgeEntry(uint id) : vid(id) {}
-        EdgeEntry() {}
-        uint vid;
-        // things
-        Eptr e;
-    };
+    enum : uint64_t { EMPTY = ~(uint64_t)0 };
+    static inline size_t hash(uint64_t k) {
+        k ^= k >> 33; k *= 0xff51afd7ed558ccdULL;
+        k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ULL;
+        k ^= k >> 33;
+        return (size_t)k;
+    }
+    inline size_t find(uint64_t key) const {
+        size_t s = hash(key) & mask;
+        while(keys[s] != EMPTY && keys[s] != key) s = (s + 1) & mask;
+        return s;
+    }
+    void insertAt(size_t slot, uint64_t key, Eptr e) {
+        keys[slot] = key;
+        vals[slot] = e;
+        if(++count * 2 > keys.size()) grow();
+    }
+    void grow() {
+        std::vector<uint64_t> ok(std::move(keys));
+        std::vector<Eptr>     ov(std::move(vals));
+        size_t cap = ok.size() * 2;
+        keys.assign(cap, (uint64_t)EMPTY);
+        vals.assign(cap, nullptr);
+        mask = cap - 1;
+        for(size_t s=0; s<ok.size(); s++) {
+            if(ok[s] == EMPTY) continue;
+            size_t t = find(ok[s]);
+            keys[t] = ok[s];
+            vals[t] = ov[s];
+        }
+    }
     
     IsctProblem *iprob;
-    std::vector< ShortVec<EdgeEntry, 8> >   edges;
+    std::vector<uint64_t>   keys;
+    std::vector<Eptr>       vals;
+    size_t                  mask  = 0;
+    size_t                  count = 0;
 };
 
 template<class VertData, class TriData>
@@ -1361,7 +1808,10 @@ template<class VertData, class TriData>
 void Mesh<VertData,TriData>::IsctProblem::createRealTriangles(
     Tprob tprob, EdgeCache &ecache
 ) {
+    using clk = std::chrono::steady_clock;
+    const bool prof = cork_prof::enabled();
     for(GTptr gt : tprob->gtris) {
+        clk::time_point a0; if(prof) a0 = clk::now();
         Tptr        t               = TopoCache::newTri();
                     gt->concrete    = t;
         Tri         &tri            = TopoCache::mesh->tris[t->ref];
@@ -1370,62 +1820,88 @@ void Mesh<VertData,TriData>::IsctProblem::createRealTriangles(
                     t->verts[k]     = v;
                     v->tris.push_back(t);
                     tri.v[k]        = v->ref;
-            
-            Eptr    e = ecache.getTriangleEdge(gt, k, tprob->the_tri);
-                    e->tris.push_back(t);
-                    t->edges[k] = e;
         }
+        clk::time_point a1; if(prof) { a1 = clk::now(); crt_ns[0] += (a1-a0).count(); }
+        // Edge topology for the new pieces is intentionally NOT built.
+        // The IsctProblem's TopoCache is discarded right after commit()
+        // (which only reads verts/tris), and boolean operations rebuild
+        // their own edge cache from the committed mesh, so the ~1.2M hash
+        // lookups + edge allocations here never influenced any output.
+        for(uint k=0; k<3; k++) t->edges[k] = nullptr;
+        (void)ecache;
+        clk::time_point a2; if(prof) { a2 = clk::now(); crt_ns[1] += (a2-a1).count(); }
                     fillOutTriData(t, tprob->the_tri);
+        if(prof) { crt_ns[2] += (clk::now()-a2).count(); }
     }
     // Once all the pieces are hooked up, let's kill the old triangle!
+    clk::time_point d0; if(prof) d0 = clk::now();
     TopoCache::deleteTri(tprob->the_tri);
+    if(prof) crt_ns[3] += (clk::now()-d0).count();
 }
 
 template<class VertData, class TriData>
 void Mesh<VertData,TriData>::IsctProblem::resolveAllIntersections()
 {
     // solve a subdivision problem in each triangle
-    tprobs.for_each([&](Tprob tprob) {
-        tprob->subdivide(this);
-    });
+    std::vector<Tprob> probs;
+    tprobs.collect(probs);
+    size_t n_new_tris = 0;
+    {
+        std::vector<typename TriangleProblem::SubdivData> sd(probs.size());
+        {
+            CORK_PROF("    subdivide: prepare");
+            for(size_t i=0; i<probs.size(); i++)
+                probs[i]->subdivide_prepare(this, sd[i]);
+        }
+        {
+            CORK_PROF("    subdivide: triangulate (par)");
+            cork_par::for_each_idx(probs.size(), 16, [&](size_t i) {
+                TriangleProblem::subdivide_triangulate(sd[i]);
+            });
+        }
+        {
+            CORK_PROF("    subdivide: finish");
+            for(size_t i=0; i<probs.size(); i++) {
+                probs[i]->subdivide_finish(this, sd[i]);
+                n_new_tris += sd[i].tris.size() / 3;
+            }
+        }
+    }
     
     // now we have diced up triangles inside each triangle problem
     
     // Let's go through the glue points and create a new concrete
     // vertex object for each of these.
-    glue_pts.for_each([&](GluePt glue) {
-        createRealPtFromGluePt(glue);
-    });
+    {
+        CORK_PROF("    createRealPtFromGluePt");
+        TopoCache::mesh->verts.reserve(TopoCache::mesh->verts.size() + glue_pts.size());
+        glue_pts.for_each([&](GluePt glue) {
+            createRealPtFromGluePt(glue);
+        });
+    }
     
-    EdgeCache ecache(this);
+    EdgeCache ecache(this, 16);   // unused now, see createRealTriangles
     
     // Now that we have concrete vertices plugged in, we can
     // go through the diced triangle pieces and create concrete triangles
     // for each of those.
     // Along the way, let's go ahead and hook up edges as appropriate
-    tprobs.for_each([&](Tprob tprob) {
-        createRealTriangles(tprob, ecache);
-    });
+    {
+        CORK_PROF("    createRealTriangles");
+        TopoCache::mesh->tris.reserve(TopoCache::mesh->tris.size() + n_new_tris);
+        for(Tprob tprob : probs)
+            createRealTriangles(tprob, ecache);
+        cork_prof::note("    crt: ns newTri+hook", (double)crt_ns[0]);
+        cork_prof::note("    crt: ns edges", (double)crt_ns[1]);
+        cork_prof::note("    crt: ns fillOutTriData", (double)crt_ns[2]);
+        cork_prof::note("    crt: ns deleteTri", (double)crt_ns[3]);
+    }
     
-    // mark all edges as normal by zero-ing out the data pointer
-    TopoCache::edges.for_each([](Eptr e) {
-        e->data = 0;
-    });
-    // then iterate over the edges formed by intersections
-    // (i.e. those edges without the boundary flag set in each triangle)
-    // and mark those by setting the data pointer
-    iepool.for_each([&](IEptr ie) {
-        // every ie must be non-boundary
-        Eptr e = ecache.maybeEdge(ie);
-        ENSURE(e);
-        e->data = (void*)1;
-    });
-    sepool.for_each([&](SEptr se) {
-        //if(se->boundary)    return; // continue
-        Eptr e = ecache.maybeEdge(se);
-        ENSURE(e);
-        e->data = (void*)1;
-    });
+    // "mark isct edges" (e->data = 1 on intersection edges) used to run here.
+    // Nothing ever read those marks: the IsctProblem (and its TopoCache) is
+    // destroyed immediately after commit(), and BoolProblem builds its own
+    // edge cache from the committed mesh.  Dropped together with the edge
+    // hookup in createRealTriangles.
     
     // This basically takes care of everything EXCEPT one detail
     // *) The base mesh data structures still need to be compacted
@@ -1489,15 +1965,29 @@ void Mesh<VertData,TriData>::testingComputeStaticIsct(
 template<class VertData, class TriData>
 void Mesh<VertData,TriData>::resolveIntersections()
 {
-    IsctProblem iproblem(this);
-    
-    iproblem.findIntersections();
-    
-    iproblem.resolveAllIntersections();
-    
-    iproblem.commit();
-    
-    //iproblem.print();
+    CORK_PROF("resolveIntersections total");
+    IsctProblem *ip = nullptr;
+    {
+        CORK_PROF("  IsctProblem ctor (topo+quant)");
+        ip = new IsctProblem(this);
+    }
+    IsctProblem &iproblem = *ip;
+    {
+        CORK_PROF("  findIntersections");
+        iproblem.findIntersections();
+    }
+    {
+        CORK_PROF("  resolveAllIntersections");
+        iproblem.resolveAllIntersections();
+    }
+    {
+        CORK_PROF("  commit");
+        iproblem.commit();
+    }
+    {
+        CORK_PROF("  ~IsctProblem");
+        delete ip;
+    }
 }
 
 template<class VertData, class TriData>

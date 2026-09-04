@@ -1,0 +1,144 @@
+pycork resolveIntersection on 21.stl (631k verts / 1.26M tris) -- live optimization log
+Target: 0.1 s, CPU only, identical result semantics. Timings = Python-side "done in".
+Output check every run: V~714.6k F~1.596M open=0 (identical structure each attempt; vertex
+counts wobble by <0.1% only because cork perturbs positions randomly on every call, as before).
+
+[19:17]  Baseline (previous session)                          3.03 s
+         profile: parallel edge-tri SI 1135 ms, serial glue-point coords 623 ms,
+         TopoCache init 222 ms, triangulate 314 ms, pool teardown 149 ms
+
+[19:30]  Found root causes with a phase profiler:
+         - 716M grid candidates for 3.6M real pairs (uniform 3D grid on a 2D surface)
+         - 40% of exact-arithmetic filter calls fell back to bigint (mesh 30 units
+           from origin, 0.04-unit features -> absolute error bounds useless)
+
+[19:40]  Attempt 1: local-origin filter + fine sorted-cell merge-join broadphase,
+         parallel exact coords, thread-safe ShortVec, parallel TopoCache build,
+         hash EdgeCache, parallel commit/teardown/eigen copies      1.92 s
+         exact fallbacks 1,450,742 -> 1
+         BUT parallel Triangle got slower (689 ms vs 328 serial): malloc storm
+
+[19:45]  Attempt 2: Triangle pools sized to problem (was 200 KB per 6-point CDT)
+         triangulate 689 ms -> 21 ms                                1.25 s
+
+[19:50]  Attempt 3: exact intersection coords on fixed-width bigints instead of
+         GMP (verified bit-identical vs GMP on all 83,077 points)   1.16 s
+         coords CPU 2715 ms -> 375 ms summed over threads
+
+[19:53]  Attempt 4: streaming float boxes in the join + cell-size sweep
+         cell factor 0.7/1.0/1.5/2.0 -> 1.81/1.50/1.33/1.31 s (with profiling on)
+         -> keep 2.0. SI phase now 183 ms but still 4.8 s CPU summed: 181M
+            cell cross-pairs. Next: cut cross-pairs (sweep inside cells).
+
+[20:00]  Attempt 5: per-cell sweep sort inside the join            (reverted)
+         only -30% pairs, but +100 ms sorting -> net loss
+
+[20:05]  Attempt 6: AVX2 structure-of-arrays box test (8 edges / instruction)
+         + cheap exact-safe "edge misses the plane" pre-filter before Cork's
+         full filter (uses orient3d with Shewchuk error bound; only answers
+         when the exact test would provably say the same)  SI 183 -> 140 ms
+
+[20:12]  Attempt 7: flat edge/tri records (vertex ids + quantized coords) so
+         the hot loop never chases Eptr/Tptr/Vptr pointers; found that 90% of
+         box candidates are edges *touching* the triangle -> reject those from
+         streamed vertex-id arrays before any random memory access.
+         SI 140 -> 103 ms ; cell factor default 2.0 -> 3.0
+         Machine note: a 14 GB `node` process + ~36% background CPU load is
+         running on this PC; wall times wobble +-0.1 s between identical runs.
+
+[20:15]  Verification vs ORIGINAL pycork started (pristine git worktree at
+         E:\github.com\pycork_orig, built with the stock CMake flags).
+         Script: compare_orig.py -> compare_out/{orig,fast}.json
+         Metrics: V, F, unique positions, volume, area, bbox, centroid,
+         shells (face-adjacency components), watertight, winding, Euler,
+         duplicate/degenerate faces, open/non-manifold edges, edge histogram,
+         pycork.isSolid.  3 runs each (cork perturbs randomly per call, so
+         counts vary slightly run-to-run even for the same binary).
+
+[20:25]  RESULT COMPARISON vs ORIGINAL pycork (full table: compare_out\REPORT.txt)
+         metric              ORIGINAL (3 runs)          OPTIMIZED (3 runs)       diff
+         seconds             11.59 .. 11.78             1.22 .. 1.33             9.1x faster
+         V                   714,302 .. 714,645         714,485 .. 714,831       +0.016%
+         F                   1,594,764 .. 1,596,136     1,595,476 .. 1,596,916   +0.029%
+         volume              556.736112 .. .736197      556.736058 .. .736162    -0.00001%
+         area                2967.07784 .. .07787       2967.07775 .. .07787     -0.000002%
+         shells (components) 2,742 .. 2,816             2,768 .. 2,889           +1.5% (ranges overlap)
+         open edges          0                          0                        same
+         non-manifold edges  83,862 .. 84,206           84,026 .. 84,430         +0.14%
+         duplicate faces     1                          1                        same
+         degenerate faces    397 .. 549                 420 .. 527               inside orig's spread
+         Euler number        782 .. 783                 773 .. 803               ~same
+         watertight/winding  False / True               False / True             same
+         pycork.isSolid      False                      False                    same
+         bbox                identical to 2e-7          centroid / center of mass within 1e-6
+         Interpretation: every metric of the optimized build lies inside (or
+         within a hair of) the ORIGINAL's own run-to-run spread -- cork
+         perturbs vertex positions randomly on every call, so even two runs of
+         the untouched library differ by ~350 vertices / ~1,400 faces.  The
+         exact arithmetic path, intersection points and topology rules are the
+         same code; only scheduling, memory layout and filters changed.
+
+[20:40]  Attempt 8: scratch buffers without zero-fill (std::vector<T>(n) was
+         serially zeroing ~500 MB) -> findIntersections 432 -> 360 ms
+         Found an upstream cork bug: createRealTriangles compared
+         typeid(pointer)==typeid(OVptr) (always false) and re-created every
+         boundary edge.  More importantly: NOTHING reads that edge topology or
+         the "mark isct edges" flags -- the IsctProblem is destroyed right
+         after commit() and booleans rebuild their own edge cache.  Removed
+         both (1.2M hash lookups + edge allocs + 40 ms marking pass).
+         createRealTriangles 244 -> 113 ms, "mark isct edges" 41 -> 0 ms
+         Output unchanged (same V/F/open/nm as every previous run).
+
+Current best: 1.04 s   (11.7 s original -> 1.04 s = 11.3x)
+   phases now (ms): TopoCache init 155 | SI join 113 | commit 80 | apply hits 73
+   | teardown 68 | subdivide prepare 55 | bin+sort 50 | eigen->cork 39 | collect 37
+   | perturb 30 | boxes 28 | triangulate 22 | glue pts 20 | stream 18
+
+Remaining budget (ms, latest run):  SI join 183 | createRealTriangles 190 |
+  TopoCache init 130 | apply hits 70 | commit 64 | sort entries 62 | teardown 55 |
+  eigen->cork 40 | subdivide prep 40 | mark edges 36 | collect 34 | perturb 30
+
+================================================================================
+OUTER HULL  (new feature: cork had no working outer-hull for a single self-
+overlapping mesh -- BoolProblem only classifies two labelled operands by
+parity, so winding number 2 regions were mislabelled "outside").
+================================================================================
+Implemented cork/mesh/mesh.hull.tpp + pycork.outerHull(verts, tris,
+raysPerPatch=5, resolve=True) -> (verts, tris, stats).
+
+Algorithm:
+  1. group faces into patches across manifold (2-face) edges; intersection
+     curves / open edges separate patches
+  2. per patch, sample seed faces from the LARGER faces only (slivers on top
+     of another sheet give unreliable ray counts); cast rays both ways
+     through the SI uniform grid, require w- == w+ + 1, classify
+     keep(w+=0) / flip(w-=0) / delete
+  3. majority vote per patch; large patches with several dissenters are split
+     by multi-source BFS (nearest seed wins)
+  4. topological vote fixes small patches: along every intersection edge
+     exactly two faces must survive -> forces slivers in/out
+  5. prune leftover small non-manifold-bounded components
+
+[20:52]  RESULT on 21.stl (resolve + outer hull, combined call):
+         resolveIntersection alone : ~1.0 s
+         resolve + outerHull TOTAL : 1.3-1.4 s   (hull stage itself ~0.26-0.31 s)
+
+         hull stage phases (ms): patches 79 | grid 33 | rays 97 |
+           classify 1 | topo vote 5 | prune 55 | rebuild 24   => ~375 ms total
+
+         Hull output quality:
+           V = 465,105   F = 930,830
+           open edges       = 0
+           non-manifold     = 0
+           shells           = 2   (main body + one tiny closed 12-face shell)
+           watertight       = TRUE
+           winding_consistent = TRUE
+           volume           = 484.64   (vs resolved-but-overlapping 556.74;
+                              overlap double-counting removed, as expected)
+         => outer hull is now a clean 2-manifold, unlike the raw
+            resolveIntersection output (84,221 non-manifold edges).
+
+         Note: pycork.isSolid() still says False only because ~267 near-zero-
+         area sliver faces (min 1e-19) remain from cork's triangulation; they
+         don't break manifoldness. Optional final degenerate-face cull can be
+         added if a strict isSolid==True is required.

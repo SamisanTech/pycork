@@ -1,0 +1,28 @@
+INPUT 21.stl: V=631,213 F=1,261,664 open=0 nm=2 volume=556.736143 area=2967.077543 shells=277 watertight=False
+
+metric               | ORIGINAL pycork (3 runs)                     | OPTIMIZED pycork (3 runs)                    | rel. diff of means
+--------------------------------------------------------------------------------------------------------------------------------------------
+seconds              | 11.592809 .. 11.782009  (mean 11.701719)     | 1.215482 .. 1.334475  (mean 1.289820)        | -88.9775%
+V                    | 714,302 .. 714,645  (mean 714,512)           | 714,485 .. 714,831  (mean 714,628)           | +0.0162%
+F                    | 1,594,764 .. 1,596,136  (mean 1,595,605)     | 1,595,476 .. 1,596,916  (mean 1,596,067)     | +0.0290%
+unique_positions     | 714,298 .. 714,644  (mean 714,509)           | 714,485 .. 714,828  (mean 714,626)           | +0.0164%
+volume               | 556.736112 .. 556.736197  (mean 556.736160)  | 556.736058 .. 556.736162  (mean 556.736107)  | -0.0000%
+area                 | 2967.077835 .. 2967.077872  (mean 2967.077859) | 2967.077747 .. 2967.077869  (mean 2967.077805) | -0.0000%
+shells               | 2,742 .. 2,816  (mean 2,783)                 | 2,768 .. 2,889  (mean 2,826)                 | +1.5449%
+unique_edges         | 2,308,284 .. 2,309,998  (mean 2,309,335)     | 2,309,188 .. 2,310,944  (mean 2,309,911)     | +0.0249%
+open_edges           | 0 .. 0  (mean 0)                             | 0 .. 0  (mean 0)                             | +0
+nonmanifold_edges    | 83,862 .. 84,206  (mean 84,073)              | 84,026 .. 84,430  (mean 84,190)              | +0.1392%
+duplicate_faces      | 1 .. 1  (mean 1)                             | 1 .. 1  (mean 1)                             | +0.0000%
+degenerate_faces     | 397 .. 549  (mean 452)                       | 420 .. 527  (mean 468)                       | +3.5398%
+euler_number         | 782 .. 783  (mean 783)                       | 773 .. 803  (mean 784)                       | +0.2129%
+watertight           | False/False/False                            | False/False/False                            | same
+winding_consistent   | True/True/True                               | True/True/True                               | same
+pycork_isSolid       | False/False/False                            | False/False/False                            | same
+bbox_min             | [-28.716204, -22.994989, -9e-06]             | [-28.716204, -22.994989, -9e-06]             | max |d|=2.00e-07
+bbox_max             | [28.716204, 11.201475, 5.697484]             | [28.716204, 11.201475, 5.697484]             | max |d|=0.00e+00
+centroid             | [0.649497, -3.385909, 1.972235]              | [0.649496, -3.38591, 1.972235]               | max |d|=1.10e-06
+center_mass          | [0.736136, -3.369356, 2.008374]              | [0.736135, -3.369357, 2.008374]              | max |d|=6.07e-07
+edge_hist run0       | {'2': 2225792, '4': 84206}                   | {'2': 2226514, '4': 84430}                   |
+shell sizes top5     | [23051, 15958, 14757, 13949, 13749]          | [23084, 15867, 14757, 13883, 13745]          |
+
+Reference: original's own run-to-run spread in V is 343 vertices (0.048%) because cork randomly perturbs positions each call.

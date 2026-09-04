@@ -50,7 +50,8 @@ struct TriEdgeIn
 bool isEmpty(const TriEdgeIn &input);
 Vec3d coords(const TriEdgeIn &input);
 bool emptyExact(const TriEdgeIn &input);
-Vec3d coordsExact(const TriEdgeIn &input);
+Vec3d coordsExact(const TriEdgeIn &input);     // fixed-width bigint, no allocs
+Vec3d coordsExactGmp(const TriEdgeIn &input);  // original GMP version (reference)
 
 struct TriTriTriIn
 {
@@ -61,10 +62,11 @@ bool isEmpty(const TriTriTriIn &input);
 Vec3d coords(const TriTriTriIn &input);
 bool emptyExact(const TriTriTriIn &input);
 Vec3d coordsExact(const TriTriTriIn &input);
+Vec3d coordsExactGmp(const TriTriTriIn &input);
 
-extern int degeneracy_count; // count degeneracies encountered
-extern int exact_count; // count of filter calls failed
-extern int callcount; // total call count
+extern thread_local int degeneracy_count; // count degeneracies encountered
+extern thread_local int exact_count; // count of filter calls failed
+extern thread_local int callcount; // total call count
 
 /*
 // exact versions

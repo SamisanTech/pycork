@@ -1,4 +1,4 @@
-// +-------------------------------------------------------------------------
+﻿// +-------------------------------------------------------------------------
 // | empty3d.cpp
 // | 
 // | Author: Gilbert Bernstein
@@ -37,9 +37,9 @@
 namespace empty3d {
 
 // externalized counters...
-int degeneracy_count = 0;
-int exact_count = 0;
-int callcount = 0;
+thread_local int degeneracy_count = 0;
+thread_local int exact_count = 0;
+thread_local int callcount = 0;
 
 using namespace ext4;
 using namespace AbsExt4;
@@ -358,10 +358,89 @@ bool exactFallback(const TriEdgeIn &input)
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// Local-origin filtering.
+//
+// The floating point filters bound their error in terms of the *absolute*
+// magnitude of the input coordinates.  For a mesh whose features are small
+// relative to its distance from the origin, that bound is hopelessly loose
+// and nearly every query falls through to the exact big-integer path.
+//
+// All the predicate signs evaluated by the filters are invariant under a
+// common translation of the input points (they compare a projective point
+// against planes/lines it lies on; the ratios are affine invariants), and a
+// translation by another quantized point is *exact* in double precision
+// (all coordinates are integer multiples of the same power-of-two quantum).
+// So we may run the filter on translated points and, when it is uncertain,
+// fall back to the exact test on the untouched originals.  The exact result
+// is unchanged; only the fraction of calls that need it drops.
+// ---------------------------------------------------------------------------
+static inline void localize(TriEdgeIn &out, const TriEdgeIn &in)
+{
+    const Vec3d org = in.tri.p[0];
+    for(uint k=0; k<3; k++) out.tri.p[k]  = in.tri.p[k]  - org;
+    for(uint k=0; k<2; k++) out.edge.p[k] = in.edge.p[k] - org;
+}
+static inline void localize(TriTriTriIn &out, const TriTriTriIn &in)
+{
+    const Vec3d org = in.tri[0].p[0];
+    for(uint i=0; i<3; i++)
+        for(uint k=0; k<3; k++)
+            out.tri[i].p[k] = in.tri[i].p[k] - org;
+}
+
+// ---------------------------------------------------------------------------
+// Cheap pre-filter: an edge misses a triangle's *plane* if both endpoints lie
+// strictly on the same side of it and the edge is not parallel to it.  In
+// that case the exact test returns "empty" (both segment-side tests are
+// strictly negative) with no degeneracy, so answering "empty" here is
+// bit-faithful.  Signs come from orient3d with Shewchuk's forward error
+// bound (7eps + 56eps^2) * permanent.
+// ---------------------------------------------------------------------------
+static inline double orient3dApprox(const Vec3d &a, const Vec3d &b,
+                                    const Vec3d &c, const Vec3d &d,
+                                    double &errbound)
+{
+    const static double O3DERRBOUND_A = (7.0 + 56.0*EPS) * EPS;
+    double adx = a.x - d.x, bdx = b.x - d.x, cdx = c.x - d.x;
+    double ady = a.y - d.y, bdy = b.y - d.y, cdy = c.y - d.y;
+    double adz = a.z - d.z, bdz = b.z - d.z, cdz = c.z - d.z;
+    double bdxcdy = bdx*cdy, cdxbdy = cdx*bdy;
+    double cdxady = cdx*ady, adxcdy = adx*cdy;
+    double adxbdy = adx*bdy, bdxady = bdx*ady;
+    double det = adz*(bdxcdy - cdxbdy)
+               + bdz*(cdxady - adxcdy)
+               + cdz*(adxbdy - bdxady);
+    double permanent = (fabs(bdxcdy) + fabs(cdxbdy)) * fabs(adz)
+                     + (fabs(cdxady) + fabs(adxcdy)) * fabs(bdz)
+                     + (fabs(adxbdy) + fabs(bdxady)) * fabs(cdz);
+    errbound = O3DERRBOUND_A * permanent;
+    return det;
+}
+
+static inline bool reliablyMissesPlane(const TriEdgeIn &in)
+{
+    double e0, e1;
+    double d0 = orient3dApprox(in.tri.p[0], in.tri.p[1], in.tri.p[2], in.edge.p[0], e0);
+    double d1 = orient3dApprox(in.tri.p[0], in.tri.p[1], in.tri.p[2], in.edge.p[1], e1);
+    bool sameSide = (d0 >  e0 && d1 >  e1) ||
+                    (d0 < -e0 && d1 < -e1);
+    if(!sameSide) return false;
+    // not parallel:  d0 - d1  is (up to sign) the w-coordinate of the
+    // line/plane meet; require it reliably non-zero
+    double w = d0 - d1;
+    double werr = (e0 + e1) * (1.0 + 8.0*EPS) + 4.0*EPS*fabs(w);
+    return fabs(w) > werr;
+}
+
 bool emptyExact(const TriEdgeIn &input)
 {
     callcount++;
-    int filter = emptyFilter(input);
+    TriEdgeIn local;
+    localize(local, input);
+    if(reliablyMissesPlane(local))
+        return true;
+    int filter = emptyFilter(local);
     if(filter == 0) {
         exact_count++;
         return exactFallback(input);
@@ -370,19 +449,84 @@ bool emptyExact(const TriEdgeIn &input)
         return filter > 0;
 }
 
+// ---------------------------------------------------------------------------
+// Exact -> double conversion with the *same* semantics as mpz_get_d
+// (truncation toward zero of the exact integer).  This lets the fixed-width
+// integer path below reproduce the GMP results bit for bit, without a single
+// heap allocation.
+// ---------------------------------------------------------------------------
+template<int N>
+static inline double limbTruncToDouble(const fixint::LimbInt<N> &in)
+{
+    fixint::LimbInt<N> mag;
+    bool negative = SIGN_BOOL(in.limbs, N) != 0;
+    if(negative) mpn_neg(mag.limbs, in.limbs, N);
+    else         mpn_copyi(mag.limbs, in.limbs, N);
+
+    int top = N - 1;
+    while(top >= 0 && mag.limbs[top] == 0) --top;
+    if(top < 0) return 0.0;
+
+    mp_limb_t hi = mag.limbs[top];
+    int lz = 0;
+    {
+        mp_limb_t t = hi;
+        while(!(t & (mp_limb_t(1) << (LIMB_BIT_SIZE - 1)))) { t <<= 1; ++lz; }
+    }
+    // top 64 significant bits, MSB aligned
+    mp_limb_t win = hi << lz;
+    if(lz > 0 && top > 0)
+        win |= mag.limbs[top - 1] >> (LIMB_BIT_SIZE - lz);
+    // 53 bit mantissa by truncation
+    mp_limb_t mant = win >> (LIMB_BIT_SIZE - 53);
+    int totalBits = (top + 1) * (int)LIMB_BIT_SIZE - lz;
+    double d = std::ldexp((double)mant, totalBits - 53);
+    return negative ? -d : d;
+}
+
+template<int N>
+static inline void fixToVec3d(Vec3d &out, const FixExt4_1<N> &in)
+{
+    Vec4d tmp;
+    tmp.x = limbTruncToDouble(in.e0);
+    tmp.y = limbTruncToDouble(in.e1);
+    tmp.z = limbTruncToDouble(in.e2);
+    tmp.w = limbTruncToDouble(in.e3);
+    tmp /= tmp.w;
+    for(uint k=0; k<3; k++)
+        out.v[k] = quantization::RESHRINK * tmp.v[k];
+}
+
 Vec3d coordsExact(const TriEdgeIn &input)
 {
-    // How many bits do we need for various intermediary values?
-    // Here we label the amount with the relevant type (i.e. EXT2)
-    // and the relevant role
-    //const static int LINE_BITS       = 2*IN_BITS + 1;
-    //const static int TRI_BITS        = LINE_BITS + IN_BITS + 2;
-    //const static int ISCT_BITS       = TRI_BITS + LINE_BITS + 2;
-    //const static int LINE_A_BITS     = ISCT_BITS + IN_BITS + 1;
-    //const static int TRI_A_BITS      = LINE_A_BITS + IN_BITS + 2;
-    //const static int INNER_LINE_BITS = LINE_A_BITS + LINE_BITS + 3;
-    //const static int INNER_TRI_BITS  = TRI_A_BITS + TRI_BITS + 2;
-    
+    const static int LINE_BITS       = 2*IN_BITS + 1;
+    const static int TRI_BITS        = LINE_BITS + IN_BITS + 2;
+    const static int ISCT_BITS       = TRI_BITS + LINE_BITS + 2;
+
+    FixExt4_1<IN_BITS>                  ep[2];
+    FixExt4_1<IN_BITS>                  tp[3];
+    for(uint i=0; i<2; i++)
+        toFixExt(ep[i], input.edge.p[i]);
+    for(uint i=0; i<3; i++)
+        toFixExt(tp[i], input.tri.p[i]);
+
+    FixExt4_2<LINE_BITS>                e;
+    join(e, ep[0], ep[1]);
+    FixExt4_2<LINE_BITS>                temp_up;
+    FixExt4_3<TRI_BITS>                 t;
+    join(temp_up, tp[0], tp[1]);
+    join(t,     temp_up, tp[2]);
+
+    FixExt4_1<ISCT_BITS>                pisct;
+    meet(pisct, e, t);
+
+    Vec3d result;
+    fixToVec3d(result, pisct);
+    return result;
+}
+
+Vec3d coordsExactGmp(const TriEdgeIn &input)
+{
     // pull in points
     GmpExt4_1                           ep[2];
     GmpExt4_1                           tp[3];
@@ -618,7 +762,9 @@ bool exactFallback(const TriTriTriIn &input)
 bool emptyExact(const TriTriTriIn &input)
 {
     callcount++;
-    int filter = emptyFilter(input);
+    TriTriTriIn local;
+    localize(local, input);
+    int filter = emptyFilter(local);
     if(filter == 0) {
         exact_count++;
         return exactFallback(input);
@@ -629,17 +775,36 @@ bool emptyExact(const TriTriTriIn &input)
 
 Vec3d coordsExact(const TriTriTriIn &input)
 {
-    // How many bits do we need for various intermediary values?
-    // Here we label the amount with the relevant type (i.e. EXT2)
-    // and the relevant role
-    //const static int EXT2_UP_BITS = 2*IN_BITS + 1;
-    //const static int EXT3_UP_BITS = EXT2_UP_BITS + IN_BITS + 2;
-    //const static int EXT2_DN_BITS = 2*EXT3_UP_BITS + 1;
-    //const static int ISCT_BITS    = EXT2_DN_BITS + EXT3_UP_BITS + 2;
-    //const static int EXT2_TA_BITS = ISCT_BITS + IN_BITS + 1;
-    //const static int EXT3_TA_BITS = EXT2_TA_BITS + IN_BITS + 2;
-    //const static int INNER_BITS   = EXT3_TA_BITS + EXT3_UP_BITS + 2;
-    
+    const static int EXT2_UP_BITS = 2*IN_BITS + 1;
+    const static int EXT3_UP_BITS = EXT2_UP_BITS + IN_BITS + 2;
+    const static int EXT2_DN_BITS = 2*EXT3_UP_BITS + 1;
+    const static int ISCT_BITS    = EXT2_DN_BITS + EXT3_UP_BITS + 2;
+
+    FixExt4_1<IN_BITS>                  p[3][3];
+    FixExt4_3<EXT3_UP_BITS>             t[3];
+    for(uint i=0; i<3; i++) {
+        for(uint j=0; j<3; j++) {
+            toFixExt(p[i][j], input.tri[i].p[j]);
+        }
+        FixExt4_2<EXT2_UP_BITS>         temp;
+        join(temp, p[i][0], p[i][1]);
+        join(t[i], temp,    p[i][2]);
+    }
+
+    FixExt4_1<ISCT_BITS>                pisct;
+    {
+        FixExt4_2<EXT2_DN_BITS>         temp;
+        meet(temp,  t[0], t[1]);
+        meet(pisct, temp, t[2]);
+    }
+
+    Vec3d result;
+    fixToVec3d(result, pisct);
+    return result;
+}
+
+Vec3d coordsExactGmp(const TriTriTriIn &input)
+{
     GmpExt4_1                           p[3][3];
     GmpExt4_3                           t[3];
     for(uint i=0; i<3; i++) {

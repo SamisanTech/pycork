@@ -143,6 +143,21 @@ inline bool hasIsct(const BBox3<N> &lhs, const BBox3<N> &rhs) {
            lhs.minp[1] <= rhs.maxp[1] && lhs.maxp[1] >= rhs.minp[1] &&
            lhs.minp[2] <= rhs.maxp[2] && lhs.maxp[2] >= rhs.minp[2];
 }
+
+// SSE specialization for double AABBs (hot path in BVH / grid)
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_AMD64)
+#include <emmintrin.h>
+template<>
+inline bool hasIsct(const BBox3<double> &lhs, const BBox3<double> &rhs) {
+    __m128d amin = _mm_set_pd(lhs.minp.y, lhs.minp.x);
+    __m128d amax = _mm_set_pd(lhs.maxp.y, lhs.maxp.x);
+    __m128d bmin = _mm_set_pd(rhs.minp.y, rhs.minp.x);
+    __m128d bmax = _mm_set_pd(rhs.maxp.y, rhs.maxp.x);
+    __m128d ok = _mm_and_pd(_mm_cmple_pd(amin, bmax), _mm_cmple_pd(bmin, amax));
+    if ((_mm_movemask_pd(ok) & 3) != 3) return false;
+    return lhs.minp.z <= rhs.maxp.z && rhs.minp.z <= lhs.maxp.z;
+}
+#endif
 template<class N>
 inline BBox3<N> convex(const BBox3<N> &lhs, const BBox3<N> &rhs) {
     return BBox3<N>(min(lhs.minp, rhs.minp), max(lhs.maxp, rhs.maxp));

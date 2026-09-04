@@ -47,7 +47,8 @@ class CMakeBuild(build_ext):
 
         cmake_args = ['-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=' + extdir,
                       '-DPYTHON_EXECUTABLE=' + sys.executable,
-                      '-DBUILD_PYTHON=ON']
+                      '-DBUILD_PYTHON=ON',
+                      '-DCMAKE_POLICY_VERSION_MINIMUM=3.5']
 
         cfg = 'Debug' if self.debug else 'Release'
         build_args = ['--config', cfg]
@@ -79,7 +80,6 @@ setup(
     version='0.1.3',
     author='Luke Parry',
     author_email='dev@lukeparry.uk',
-    url='https://github.com/drlukeparry/pycork',
     long_description=readme,
     long_description_content_type = 'text/x-rst',
     description='pycork provides a fully compiled interface to the cork boolean library ',
@@ -102,10 +102,5 @@ setup(
         'Natural Language :: English',
         'Topic :: Scientific/Engineering'],
     license="",
-    project_urls = {
-    'Documentation': 'https://github.com/drylukeparry/pycork',
-    'Source': 'https://github.com/drylukeparry/pycork',
-    'Tracker': 'https://github.com/drlukeparry/pycork/issues'
-    }
 )
 

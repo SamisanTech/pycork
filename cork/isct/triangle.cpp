@@ -646,16 +646,22 @@ struct memorypool {
 
 /* Global constants.                                                         */
 
-REAL splitter;       /* Used to split REAL factors for exact multiplication. */
-REAL epsilon;                             /* Floating-point machine epsilon. */
-REAL resulterrbound;
-REAL ccwerrboundA, ccwerrboundB, ccwerrboundC;
-REAL iccerrboundA, iccerrboundB, iccerrboundC;
-REAL o3derrboundA, o3derrboundB, o3derrboundC;
+/* thread_local: triangulate() is otherwise fully reentrant (all state lives */
+/*   in struct mesh / struct behavior).  Making these per-thread lets cork   */
+/*   triangulate many independent problems concurrently.  Results are       */
+/*   unchanged: triangleinit() resets randomseed and recomputes the          */
+/*   constants on every call anyway.                                         */
+
+thread_local REAL splitter; /* Used to split REAL factors for exact multiplication. */
+thread_local REAL epsilon;                /* Floating-point machine epsilon. */
+thread_local REAL resulterrbound;
+thread_local REAL ccwerrboundA, ccwerrboundB, ccwerrboundC;
+thread_local REAL iccerrboundA, iccerrboundB, iccerrboundC;
+thread_local REAL o3derrboundA, o3derrboundB, o3derrboundC;
 
 /* Random number seed is not constant, but I've made it global anyway.       */
 
-unsigned long randomseed;                     /* Current random number seed. */
+thread_local unsigned long randomseed;        /* Current random number seed. */
 
 
 /* Mesh data structure.  Triangle operates on only one mesh, but the mesh    */
@@ -4296,10 +4302,16 @@ struct behavior *b;
     vertexsize = (m->vertex2triindex + 1) * sizeof(triangle);
   }
 
-  /* Initialize the pool of vertices. */
-  poolinit(&m->vertices, vertexsize, VERTEXPERBLOCK,
-           m->invertices > VERTEXPERBLOCK ? m->invertices : VERTEXPERBLOCK,
-           sizeof(REAL));
+  /* Initialize the pool of vertices.                                      */
+  /*   cork: size the blocks to the problem.  The original always grabbed  */
+  /*   >= 4092 items (hundreds of KB) even for a 6 point problem, which    */
+  /*   made tens of thousands of tiny triangulations allocation bound.     */
+  {
+    int nfirst = m->invertices + 4;
+    if (nfirst < 16) nfirst = 16;
+    int nblock = nfirst > VERTEXPERBLOCK ? VERTEXPERBLOCK : nfirst;
+    poolinit(&m->vertices, vertexsize, nblock, nfirst, sizeof(REAL));
+  }
 }
 
 /*****************************************************************************/
@@ -4356,15 +4368,22 @@ struct behavior *b;
   }
 
   /* Having determined the memory size of a triangle, initialize the pool. */
-  poolinit(&m->triangles, trisize, TRIPERBLOCK,
-           (2 * m->invertices - 2) > TRIPERBLOCK ? (2 * m->invertices - 2) :
-           TRIPERBLOCK, 4);
+  /*   cork: problem-sized blocks (see initializevertexpool).              */
+  {
+    int nfirst = 2 * m->invertices + 8;
+    if (nfirst < 16) nfirst = 16;
+    int nblock = nfirst > TRIPERBLOCK ? TRIPERBLOCK : nfirst;
+    poolinit(&m->triangles, trisize, nblock, nfirst, 4);
+  }
 
   if (b->usesegments) {
     /* Initialize the pool of subsegments.  Take into account all eight */
     /*   pointers and one boundary marker.                              */
+    int nfirst = 3 * m->invertices + 8;
+    if (nfirst < 16) nfirst = 16;
+    int nblock = nfirst > SUBSEGPERBLOCK ? SUBSEGPERBLOCK : nfirst;
     poolinit(&m->subsegs, 8 * sizeof(triangle) + sizeof(int),
-             SUBSEGPERBLOCK, SUBSEGPERBLOCK, 4);
+             nblock, nfirst, 4);
 
     /* Initialize the "outer space" triangle and omnipresent subsegment. */
     dummyinit(m, b, m->triangles.itembytes, m->subsegs.itembytes);
@@ -13024,7 +13043,10 @@ int regions;
   if (((holes > 0) && !b->noholes) || !b->convex || (regions > 0)) {
     /* Initialize a pool of viri to be used for holes, concavities, */
     /*   regional attributes, and/or regional area constraints.     */
-    poolinit(&m->viri, sizeof(triangle *), VIRUSPERBLOCK, VIRUSPERBLOCK, 0);
+    int nfirst = 2 * m->invertices + 8;               /* cork: problem-sized */
+    if (nfirst < 16) nfirst = 16;
+    int nblock = nfirst > VIRUSPERBLOCK ? VIRUSPERBLOCK : nfirst;
+    poolinit(&m->viri, sizeof(triangle *), nblock, nfirst, 0);
   }
 
   if (!b->convex) {

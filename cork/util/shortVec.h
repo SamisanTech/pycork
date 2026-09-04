@@ -23,23 +23,21 @@
 // |    of the GNU Lesser General Public License
 // |    along with Cork.  If not, see <http://www.gnu.org/licenses/>.
 // +-------------------------------------------------------------------------
-#ifndef CORK_SHORTVEC_H_HEADER_HAS_BEEN_INCLUDED
-#define CORK_SHORTVEC_H_HEADER_HAS_BEEN_INCLUDED
+#pragma once
 
 #include <algorithm>
+#include <new>
+#include <cstring>
 
 #include "prelude.h"
-#include "memPool.h"
 
-// Don't know why, but can't get this to compile
-// when I make the datablock def. a member of ShortVec<T,LEN>
-template<class T, uint LEN>
-struct ShortVecBlock_Private {
-    byte data[sizeof(T)*LEN];
-};
-// We allocate these blocks instead of typed arrays
-// in order to ensure that we get control of allocation/deallocation
-// rather than the allocator attempting to do so.
+// Small vector with LEN entries of inline storage.
+//
+// This replaces the original implementation, which drew its small blocks
+// from a *shared static MemPool*; that pool was not thread safe, which made
+// it impossible to construct or destroy any topology object from more than
+// one thread.  Inline storage is thread safe, removes a pointer chase on
+// every access, and keeps the exact same API.
 
 template<class T, uint LEN>
 class ShortVec
@@ -48,7 +46,6 @@ public: // constructor/destructor
     ShortVec(uint size = 0);
     ShortVec(uint size, const T &fill_val);
     ShortVec(const ShortVec<T,LEN> &cp);
-    //ShortVec(ShortVec<T,LEN> &&cp); // move constructor
     ~ShortVec();
     
     ShortVec<T,LEN>& operator=(const ShortVec<T,LEN> &vec);
@@ -74,51 +71,39 @@ public: // modifiers
     void erase(const T &val); // erase if it can be found
     
 private: // helper functions
+    inline T* inlineData() { return reinterpret_cast<T*>(inline_buf); }
     T*   allocData(uint space, uint &allocated);
     void deallocData(T* data_ptr, uint allocated);
     
     void constructRange(T* array, int begin, int end);
-    void copyConstructRange(T* src, T* dest, int begin, int end);
+    void copyConstructRange(const T* src, T* dest, int begin, int end);
     void destructRange(T* array, int begin, int end);
     
     // resize, manage allocation/deallocation,
     // but not construction/destruction
     void resizeHelper(uint newsize);
     
-public: // shared data structures and data.
-    static MemPool< ShortVecBlock_Private<T,LEN> > pool;
-    
 private: // instance data
     uint user_size;     // actual number of entries from client perspective
-    uint internal_size; // number of entries allocated, if greater than LEN;
-                        // if allocated from the memory pool, this is 0
+    uint internal_size; // number of entries allocated (>= LEN)
     T* data;
+    alignas(T) byte inline_buf[sizeof(T)*LEN];
 };
-
-template<class T, uint LEN>
-MemPool< ShortVecBlock_Private<T,LEN> > ShortVec<T,LEN>::pool;
 
 template<class T, uint LEN> inline
 T* ShortVec<T,LEN>::allocData(uint space, uint &allocated)
 {
-    T* result;
     if(space <= LEN) {
         allocated = LEN;
-        result =  reinterpret_cast<T*>(pool.alloc());
-    } else {
-        allocated = space;
-        result = reinterpret_cast<T*>(new byte[sizeof(T)*space]);
+        return inlineData();
     }
-    //if(LEN == 2) std::cout << "        Allocing:   " << result << std::endl;
-    return result;
+    allocated = space;
+    return reinterpret_cast<T*>(new byte[sizeof(T)*space]);
 }
 template<class T, uint LEN> inline
 void ShortVec<T,LEN>::deallocData(T* data_ptr, uint allocated)
 {
-    //if(LEN == 2) std::cout << "        Deallocing: " << data_ptr << std::endl;
-    if(allocated <= LEN)
-        pool.free(reinterpret_cast< ShortVecBlock_Private<T,LEN>* >(data_ptr));
-    else
+    if(allocated > LEN)
         delete[] reinterpret_cast<byte*>(data_ptr);
 }
 
@@ -129,9 +114,8 @@ void ShortVec<T,LEN>::constructRange(T* array, int begin, int end)
         new (&(array[i])) T();
 }
 template<class T, uint LEN> inline
-void ShortVec<T,LEN>::copyConstructRange(T* src, T* dest, int begin, int end)
+void ShortVec<T,LEN>::copyConstructRange(const T* src, T* dest, int begin, int end)
 {
-    // copy actual data over
     for(int i=begin; i<end; i++)
         new (&(dest[i])) T(src[i]);
 }
@@ -142,30 +126,19 @@ void ShortVec<T,LEN>::destructRange(T* array, int begin, int end)
         (&(array[i]))->~T();
 }
 
-// we use a strictly increasing allocation size policy
-// with array length doubling to ensure that the cost of
-// copying array entries on a reallocation has
-// constant amortized cost.  This is important when the
-// vector is used to accumulate a list of values.
 template<class T, uint LEN> inline
 void ShortVec<T,LEN>::resizeHelper(uint newsize) {
     if(newsize > internal_size) { // we need more space!
-        // setup the new data block with at least twice as much space
         uint new_space;
         T *new_data = allocData(std::max(newsize, internal_size*2), new_space);
-        // copy data and destroy old copies
         copyConstructRange(data, new_data, 0, user_size);
         destructRange(data, 0, user_size);
-        // free old data
         deallocData(data, internal_size);
         data = new_data;
         internal_size = new_space;
     }
     user_size = newsize;
 }
-
-
-
 
 template<class T, uint LEN> inline
 ShortVec<T,LEN>::ShortVec(uint size) : user_size(size)
@@ -177,7 +150,6 @@ template<class T, uint LEN> inline
 ShortVec<T,LEN>::ShortVec(uint size, const T &fill_val) : user_size(size)
 {
     data = allocData(user_size, internal_size);
-    // then fill
     for(uint i=0; i<user_size; i++)
         new (&data[i]) T(fill_val);
 }
@@ -185,19 +157,8 @@ template<class T, uint LEN> inline
 ShortVec<T,LEN>::ShortVec(const ShortVec<T,LEN> &cp) : user_size(cp.user_size)
 {
     data = allocData(user_size, internal_size);
-    // copy actual data over
     copyConstructRange(cp.data, data, 0, user_size);
 }
-/*template<class T, uint LEN> inline
-ShortVec<T,LEN>::ShortVec(ShortVec<T,LEN> &&cp)
-{
-    user_size = cp.user_size;
-    internal_size = cp.internal_size;
-    data = cp.data;
-    cp.user_size = 0; // ensure that no destructors are called
-    cp.internal_size = 0; // ensure that pool free is called
-    cp.data = NULL; // on a null pointer, which will do nothing
-}*/
 template<class T, uint LEN> inline
 ShortVec<T,LEN>::~ShortVec()
 {
@@ -208,37 +169,24 @@ ShortVec<T,LEN>::~ShortVec()
 template<class T, uint LEN> inline
 ShortVec<T,LEN>& ShortVec<T,LEN>::operator=(const ShortVec<T,LEN> &vec)
 {
+    if(this == &vec) return *this;
     uint old_size = user_size;
-    
-    // ensure there is enough space allocated at the destination
     resizeHelper(vec.user_size);
-    
-    // copy assignment for all data in range overlap
     for(uint i=0; i<std::min(vec.user_size, old_size); i++)
         data[i] = vec.data[i];
-    
-    // if the new range is larger, copy construct the portion
-    // outside of the old range
-    if(vec.user_size > old_size) {
+    if(vec.user_size > old_size)
         copyConstructRange(vec.data, data, old_size, vec.user_size);
-    }
-    
-    // if the new range is smaller, destruct old unused entries
     if(vec.user_size < old_size)
         destructRange(data, vec.user_size, old_size);
-    
     return *this;
 }
 
 template<class T, uint LEN> inline
 void ShortVec<T,LEN>::resize(uint newsize) {
     uint oldsize = user_size;
-    
     resizeHelper(newsize);
-    
     if(oldsize < newsize)
         constructRange(data, oldsize, newsize);
-    
     if(newsize < oldsize)
         destructRange(data, newsize, oldsize);
 }
@@ -262,6 +210,3 @@ void ShortVec<T,LEN>::erase(const T &val)
         }
     }
 }
-
-#endif
-

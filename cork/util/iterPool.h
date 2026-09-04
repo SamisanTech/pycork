@@ -27,30 +27,11 @@
 #define CORK_ITERPOOL_H_HEADER_HAS_BEEN_INCLUDED
 
 #include "prelude.h"
-// +-------------------------------------------------------------------------
-// | WHAT IS THIS?
-// | 
-// | An IterPool is
-// |    *)  a memory pool -- new items can be requested, old items released
-// |    *)  iterable -- all of the allocated items can be iterated over
-// | It was built primarily to support dynamic connectivity structures
-// | for triangle meshes, such as those used during re-meshing.
-// |
-// | These processes often require the frequent allocation and
-// | deallocation of mesh elements and become easier to write when
-// | elements do not move around in memory, since valid pointers can be
-// | maintained.  std::vector does not provide guaranteed static locations.
-// |
-// | Using a memory pool--threaded with a linked list--provides fast
-// | allocation/deallocation and relatively speedy enumeration of all
-// | currently allocated elements.  While not as memory access friendly
-// | as an array or std::vector, the cost of linked list enumeration
-// | comes out in the wash compared to the pointer chasing performed
-// | for each element.
-// +-------------------------------------------------------------------------
-
 #include "memPool.h"
+#include "parallel.h"
 #include <utility>
+#include <vector>
+#include <functional>
 
 template<class T>
 class IterPool
@@ -105,6 +86,43 @@ private:
     };
     Block *block_list;
     
+public: // bulk allocation support
+    // n contiguous objects, default constructed (in parallel), linked into
+    // the iteration list ahead of everything already allocated.
+    struct Bulk {
+        Block *base = nullptr;
+        uint   n    = 0;
+        inline T* operator[](size_t i) const { return (T*)(base + i); }
+    };
+    Bulk alloc_bulk(uint n) {
+        Bulk b;
+        b.n = n;
+        if(n == 0) return b;
+        b.base = reinterpret_cast<Block*>(pool.allocContiguous((int)n));
+        Block *base     = b.base;
+        Block *old_head = block_list;
+        cork_par::for_range((size_t)n, 8192, [&](size_t s, size_t e) {
+            for(size_t i = s; i < e; ++i) {
+                Block *blk = base + i;
+                new ((T*)blk) T();
+                blk->prev = (i == 0) ? nullptr : (base + i - 1);
+                blk->next = (i + 1 < (size_t)n) ? (base + i + 1) : old_head;
+            }
+        });
+        if(old_head) old_head->prev = base + n - 1;
+        block_list  = base;
+        numAlloced += n;
+        return b;
+    }
+
+    // destroy everything and drop all memory
+    void release() {
+        for_each([](T* obj) { obj->~T(); });
+        numAlloced = 0;
+        block_list = nullptr;
+        pool.release();
+    }
+
 public: // allocation/deallocation support
     T* alloc() {
         Block *new_block = pool.alloc();
@@ -134,12 +152,20 @@ public: // allocation/deallocation support
     }
     
 public:
-    inline void for_each(std::function<void(T*)> func) const {
+    template<class F>
+    inline void for_each(F func) const {
         for(Block *block = block_list;
           block != NULL;
           block = block->next) {
             func((T*)(block));
         }
+    }
+    // snapshot of all live objects, in iteration order
+    void collect(std::vector<T*> &out) const {
+        out.clear();
+        out.reserve(numAlloced);
+        for(Block *block = block_list; block != NULL; block = block->next)
+            out.push_back((T*)(block));
     }
     inline bool contains(T* tptr) const {
         for(Block *block = block_list;

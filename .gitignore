@@ -1076,3 +1076,8 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+wheels/
+external/ispc/
+compare_out/*.stl
+*.pyd
+__pycache__/

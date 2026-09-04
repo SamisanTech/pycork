@@ -5,6 +5,7 @@
 #include <cork/rawmesh/rawMesh.h>
 #include <cork/mesh/mesh.h>
 #include <cork/cork.h>
+#include <cork/util/profile.h>
 
 #include <pybind11/pybind11.h>
 
@@ -126,21 +127,69 @@ MeshTuple booleanXor(const EigenVecX3d &vertsA,
 
 MeshTuple resolveIntersection(const EigenVecX3d &vertsA,
                               const EigenVecX3i &trisA) {
-
+    CORK_PROF("py.resolveIntersection total");
     CorkMesh meshA;
 
-    eigenToCorkMesh(vertsA, trisA, &meshA);
+    {
+        CORK_PROF("py.eigenToCorkMesh");
+        eigenToCorkMesh(vertsA, trisA, &meshA);
+    }
 
     MeshTuple meshOut;
 
-    meshA.resolveIntersections();
+    {
+        CORK_PROF("py.Mesh::resolveIntersections");
+        meshA.resolveIntersections();
+    }
 
-    corkMesh2Eigen(meshA, std::get<0>(meshOut), std::get<1>(meshOut));
+    {
+        CORK_PROF("py.corkMesh2Eigen");
+        corkMesh2Eigen(meshA, std::get<0>(meshOut), std::get<1>(meshOut));
+    }
 
     return meshOut;
 }
 
-
+// resolve self-intersections, then keep only the outer hull
+// (faces with generalized winding number 0 on their outside).
+// Returns (verts, tris, stats) with stats = {patches, kept, flipped, deleted, unresolved, rays}
+std::tuple<EigenVecX3d, EigenVecX3i, py::dict> outerHull(const EigenVecX3d &vertsA,
+                                                          const EigenVecX3i &trisA,
+                                                          int raysPerPatch,
+                                                          bool resolve) {
+    CORK_PROF("py.outerHull total");
+    CorkMesh meshA;
+    {
+        CORK_PROF("py.eigenToCorkMesh");
+        eigenToCorkMesh(vertsA, trisA, &meshA);
+    }
+    if (resolve) {
+        CORK_PROF("py.Mesh::resolveIntersections");
+        meshA.resolveIntersections();
+    }
+    cork_hull::HullStats st;
+    {
+        CORK_PROF("py.Mesh::outerHull");
+        meshA.outerHull(raysPerPatch, &st);
+    }
+    std::tuple<EigenVecX3d, EigenVecX3i, py::dict> out;
+    {
+        CORK_PROF("py.corkMesh2Eigen");
+        corkMesh2Eigen(meshA, std::get<0>(out), std::get<1>(out));
+    }
+    py::dict d;
+    d["patches"] = st.patches;
+    d["kept"] = st.kept;
+    d["flipped"] = st.flipped;
+    d["deleted"] = st.deleted;
+    d["unresolved_patches"] = st.unresolved;
+    d["split_patches"] = st.split_patches;
+    d["seeds"] = st.seeds;
+    d["sliver_faces_pruned"] = st.pruned;
+    d["rays"] = st.rays;
+    std::get<2>(out) = d;
+    return out;
+}
 
 } // end of namespace
 
@@ -172,7 +221,11 @@ PYBIND11_MODULE(pycork, m) {
                            py::arg("vertsA"), py::arg("trisA"),
                            py::arg("vertsB"), py::arg("trisB"))
      .def("resolveIntersection", &pycork::resolveIntersection, "Computes the intersection between two meshes",
-                                  py::arg("vertsA"), py::arg("trisA"));
+                                  py::arg("vertsA"), py::arg("trisA"))
+     .def("outerHull", &pycork::outerHull,
+          "Resolves self-intersections and keeps only the outer hull (winding-number 0 side). "
+          "Returns (verts, tris, stats)",
+          py::arg("verts"), py::arg("tris"), py::arg("raysPerPatch") = 5, py::arg("resolve") = true);
 
 
 #ifdef PROJECT_VERSION
