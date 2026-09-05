@@ -42,18 +42,19 @@ public:
         }
         if (opt.collapse) collapse_short_edges(mesh, opt.collapseRel);
         bool needFill = true;
-        if (opt.hull) {
+        if (opt.hull && !opt.deferHull) {
             CORK_PROF("repair.hull");
             cork_hull::HullStats hs;
-            mesh.outerHull(opt.raysPerPatch, &hs,
-                           opt.noise ? opt.noiseAreaFrac : 0.0);
+            extract_hull(mesh, opt, &hs);
             needFill = !hs.closed;
+        } else if (opt.hull && opt.deferHull) {
+            needFill = false;
         } else if (opt.noise) {
             drop_small_shells(mesh, opt.noiseAreaFrac);
         }
         // close_leftover (weld+puzzle+fill) is opt.puzzle — leftover split
         // on a 100k+ soup is seconds and did not close these rims.
-        if (needFill) {
+        if (needFill && opt.fill) {
             if (opt.puzzle) close_leftover(mesh, opt, nullptr);
             else fill_boundary_loops(mesh);
         }

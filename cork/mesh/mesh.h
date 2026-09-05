@@ -260,7 +260,11 @@ public: // OUTER HULL module (single mesh; call after resolveIntersections)
     // keeps only faces whose one side has generalized winding number 0,
     // flipping faces whose *back* side is exterior.  See mesh.hull.tpp.
     void outerHull(int raysPerPatch = 5, cork_hull::HullStats *stats = nullptr,
-                   double leftoverAreaFrac = 0.0);
+                   double leftoverAreaFrac = 0.0, bool exact = false);
+    // Same patch hull as outerHull, but Manifold-style axis-aligned winding
+    // (+Z, then +X/+Y).  Opt-in; default path stays random-ray outerHull().
+    void outerHullExact(cork_hull::HullStats *stats = nullptr,
+                        double leftoverAreaFrac = 0.0);
     // True if a busy vertex has an edge used 8+ times (stacked duplicate
     // faces).  Cheap; no mesh copy.  Used to decide pre-SI dup drop.
     bool hasStackedDuplicateFaces() const;
@@ -1253,6 +1257,7 @@ void Mesh<VertData, TriData>::TopoCache::print()
 #include "mesh.isct.tpp"
 #include "mesh.bool.tpp"
 #include "mesh.hull.tpp"
+#include "mesh.hull_exact.tpp"
 
 
 #endif

@@ -32,6 +32,37 @@ typedef Eigen::Matrix<double,Eigen::Dynamic,3> EigenVecX3d;
 typedef Eigen::Matrix<uint64_t,Eigen::Dynamic,3> EigenVecX3i;
 typedef std::tuple<EigenVecX3d, EigenVecX3i> MeshTuple;
 
+static py::object g_manifold;
+
+void set_manifold(py::object mod) { g_manifold = std::move(mod); }
+
+static bool manifold_hull_requested(const std::string &backend) {
+    return backend == "manifold" || backend == "exact" || backend == "union_all";
+}
+
+static bool has_manifold() {
+    return bool(g_manifold) && !g_manifold.is_none() && py::hasattr(g_manifold, "union_all");
+}
+
+// Exact Manifold outer solid: Decompose + BatchBoolean Add (not convex Hull).
+static bool apply_manifold_union_all(CorkMesh &mesh) {
+    if (!has_manifold())
+        return false;
+    EigenVecX3d v;
+    EigenVecX3i f;
+    corkMesh2Eigen(mesh, v, f);
+    py::object out = g_manifold.attr("union_all")(v, f);
+    py::sequence t = out;
+    EigenVecX3d v2 = t[0].cast<EigenVecX3d>();
+    typedef Eigen::Matrix<int64_t, Eigen::Dynamic, 3> EigenVecX3i64;
+    EigenVecX3i64 fi = t[1].cast<EigenVecX3i64>();
+    EigenVecX3i f2 = fi.cast<uint64_t>();
+    if (v2.rows() == 0 || f2.rows() == 0)
+        return false;
+    eigenToCorkMesh(v2, f2, &mesh);
+    return true;
+}
+
 bool isSolid(const EigenVecX3d &verts,
              const EigenVecX3i &tris) {
 
@@ -161,7 +192,9 @@ MeshTuple resolveIntersection(const EigenVecX3d &vertsA,
 std::tuple<EigenVecX3d, EigenVecX3i, py::dict> outerHull(const EigenVecX3d &vertsA,
                                                           const EigenVecX3i &trisA,
                                                           int raysPerPatch,
-                                                          bool resolve) {
+                                                          bool resolve,
+                                                          const std::string &hull_backend,
+                                                          bool exact) {
     CORK_PROF("py.outerHull total");
     CorkMesh meshA;
     {
@@ -173,7 +206,29 @@ std::tuple<EigenVecX3d, EigenVecX3i, py::dict> outerHull(const EigenVecX3d &vert
         meshA.resolveIntersections();
     }
     cork_hull::HullStats st;
-    {
+    std::string used = "ours";
+    const bool wantManifold = !exact && manifold_hull_requested(hull_backend);
+    if (wantManifold) {
+        CORK_PROF("py.outerHull.manifold");
+        bool ok = false;
+        try {
+            ok = apply_manifold_union_all(meshA);
+        } catch (const py::error_already_set &) {
+            ok = false;
+        } catch (const std::exception &) {
+            ok = false;
+        }
+        if (ok) {
+            used = "manifold";
+        } else {
+            meshA.outerHull(raysPerPatch, &st);
+            used = "ours";
+        }
+    } else if (exact) {
+        CORK_PROF("py.Mesh::outerHullExact");
+        meshA.outerHullExact(&st);
+        used = "exact";
+    } else {
         CORK_PROF("py.Mesh::outerHull");
         meshA.outerHull(raysPerPatch, &st);
     }
@@ -183,6 +238,8 @@ std::tuple<EigenVecX3d, EigenVecX3i, py::dict> outerHull(const EigenVecX3d &vert
         corkMesh2Eigen(meshA, std::get<0>(out), std::get<1>(out));
     }
     py::dict d;
+    d["hull_backend"] = used;
+    d["exactHull"] = exact;
     d["patches"] = st.patches;
     d["kept"] = st.kept;
     d["flipped"] = st.flipped;
@@ -241,16 +298,21 @@ std::tuple<EigenVecX3d, EigenVecX3i, py::dict> repair(const EigenVecX3d &verts,
                                                      int minFaces,
                                                      int hardDegree,
                                                      double perturbIntensity,
-                                                     double collapseRel) {
+                                                     double collapseRel,
+                                                     const std::string &hull_backend,
+                                                     bool exactHull) {
     CORK_PROF("py.repair total");
     CorkMesh mesh;
     {
         CORK_PROF("py.eigenToCorkMesh");
         eigenToCorkMesh(verts, tris, &mesh);
     }
+    const bool wantManifold = hull && !exactHull && manifold_hull_requested(hull_backend);
     cork::repair::Options opt;
     opt.resolve = resolve;
     opt.hull = hull;
+    opt.exactHull = exactHull;
+    opt.deferHull = wantManifold;
     opt.unify = unify;
     opt.cluster = cluster;
     opt.puzzle = puzzle;
@@ -259,6 +321,7 @@ std::tuple<EigenVecX3d, EigenVecX3i, py::dict> repair(const EigenVecX3d &verts,
     opt.noise = noise;
     opt.collapse = collapse;
     opt.si_subset = si_subset;
+    opt.fill = !wantManifold;
     opt.raysPerPatch = raysPerPatch;
     opt.minFaces = minFaces;
     opt.hardDegree = hardDegree;
@@ -266,6 +329,28 @@ std::tuple<EigenVecX3d, EigenVecX3i, py::dict> repair(const EigenVecX3d &verts,
     opt.collapseRel = collapseRel;
     cork::repair::Stats st;
     cork::repair::Pipeline::run(mesh, opt, &st);
+
+    std::string used = !hull ? "off" : (exactHull ? "exact" : "ours");
+    bool fallback = false;
+    if (wantManifold) {
+        CORK_PROF("repair.hull.manifold");
+        bool ok = false;
+        try {
+            ok = apply_manifold_union_all(mesh);
+        } catch (const py::error_already_set &) {
+            ok = false;
+        } catch (const std::exception &) {
+            ok = false;
+        }
+        if (ok) {
+            used = "manifold";
+        } else {
+            cork_hull::HullStats hs;
+            cork::repair::extract_hull(mesh, opt, &hs);
+            used = opt.exactHull ? "exact" : "ours";
+            fallback = true;
+        }
+    }
 
     std::tuple<EigenVecX3d, EigenVecX3i, py::dict> out;
     {
@@ -275,6 +360,9 @@ std::tuple<EigenVecX3d, EigenVecX3i, py::dict> repair(const EigenVecX3d &verts,
     py::dict d;
     d["resolve"] = resolve;
     d["hull"] = hull;
+    d["hull_backend"] = used;
+    d["exactHull"] = exactHull;
+    d["hull_fallback"] = fallback;
     d["unify"] = unify;
     d["cluster"] = cluster;
     d["puzzle"] = puzzle;
@@ -327,10 +415,17 @@ PYBIND11_MODULE(pycork, m) {
                            py::arg("vertsB"), py::arg("trisB"))
      .def("resolveIntersection", &pycork::resolveIntersection, "Computes the intersection between two meshes",
                                   py::arg("vertsA"), py::arg("trisA"))
+     .def("set_manifold", &pycork::set_manifold,
+          "Inject Exact Manifold module (must expose union_all). Used when hull_backend='manifold'.",
+          py::arg("mod"))
+     .def("has_manifold", &pycork::has_manifold,
+          "True if set_manifold() was given a module with union_all.")
      .def("outerHull", &pycork::outerHull,
-          "Resolves self-intersections and keeps only the outer hull (winding-number 0 side). "
+          "Resolves self-intersections and keeps only the outer hull. "
+          "hull_backend: 'ours' (winding) or 'manifold' (Exact Decompose+BatchBoolean Add). "
           "Returns (verts, tris, stats)",
-          py::arg("verts"), py::arg("tris"), py::arg("raysPerPatch") = 5, py::arg("resolve") = true)
+          py::arg("verts"), py::arg("tris"), py::arg("raysPerPatch") = 5, py::arg("resolve") = true,
+          py::arg("hull_backend") = "ours", py::arg("exact") = false)
      .def("readSTL", &pycork::readSTL,
           "Fast binary STL load + exact-float vertex weld. Returns (verts, tris).",
           py::arg("path"))
@@ -354,7 +449,9 @@ PYBIND11_MODULE(pycork, m) {
           py::arg("minFaces") = 5,
           py::arg("hardDegree") = 30,
           py::arg("perturbIntensity") = 1e-3,
-          py::arg("collapseRel") = 0.02);
+          py::arg("collapseRel") = 0.02,
+          py::arg("hull_backend") = "ours",
+          py::arg("exactHull") = false);
 
 
 #ifdef PROJECT_VERSION

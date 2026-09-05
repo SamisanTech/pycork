@@ -92,6 +92,9 @@ CORK_EXPORT void corkMesh2Eigen(const CorkMesh &mesh,
                                 Eigen::Matrix<double, Eigen::Dynamic, 3> &verts,
                                 Eigen::Matrix<uint64_t, Eigen::Dynamic, 3> &tris);
 
+CORK_EXPORT void corkTriMesh2CorkMesh(CorkTriMesh in, CorkMesh *mesh_out);
+CORK_EXPORT void corkMesh2CorkTriMesh(CorkMesh *mesh_in, CorkTriMesh *out);
+
 CORK_EXPORT void freeCorkTriMesh(CorkTriMesh *mesh);
 
 // the inputs to Boolean operations must be "solid":

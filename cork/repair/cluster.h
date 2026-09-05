@@ -252,7 +252,7 @@ inline void pile_split_repair(CorkMesh &mesh, const Options &opt) {
         if (opt.resolve) mesh.resolveIntersections();
         if (opt.hull) {
             cork_hull::HullStats hs;
-            mesh.outerHull(opt.raysPerPatch, &hs, opt.noise ? opt.noiseAreaFrac : 0.0);
+            extract_hull(mesh, opt, &hs);
             if (!hs.closed) fill_boundary_loops(mesh);
         }
         return;
@@ -291,7 +291,7 @@ inline void pile_split_repair(CorkMesh &mesh, const Options &opt) {
         }
         if (opt.hull) {
             cork_hull::HullStats hs;
-            m.outerHull(opt.raysPerPatch, &hs, opt.noise ? opt.noiseAreaFrac : 0.0);
+            extract_hull(m, opt, &hs);
             if (!hs.closed) fill_boundary_loops(m);
         }
     };

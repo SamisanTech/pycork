@@ -462,5 +462,14 @@ inline void resolve_si_subset(CorkMesh &mesh) {
     mesh.disjointUnion(restMesh);
 }
 
+inline void extract_hull(CorkMesh &mesh, const Options &opt,
+                         cork_hull::HullStats *hs) {
+    const double leftover = opt.noise ? opt.noiseAreaFrac : 0.0;
+    if (opt.exactHull)
+        mesh.outerHullExact(hs, leftover);
+    else
+        mesh.outerHull(opt.raysPerPatch, hs, leftover);
+}
+
 }  // namespace repair
 }  // namespace cork

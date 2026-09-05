@@ -1332,7 +1332,7 @@ bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
         });
     }
 
-    const bool useLBVH = mesh->preferLbvhIsct || std::getenv("CORK_LBVH") != nullptr;
+    const bool useLBVH = TopoCache::mesh->preferLbvhIsct || std::getenv("CORK_LBVH") != nullptr;
     std::vector<EdgeTriHit> hits;
     int any_degen = 0;
 
@@ -1646,7 +1646,8 @@ void Mesh<VertData,TriData>::IsctProblem::perturbPositions()
 {
     // Sheet piles need a slightly larger first kick or SI degeneracies
     // force 2 empty retries (~0.8s).  slc 21 never sets preferLbvhIsct.
-    const double EPSILON = mesh->preferLbvhIsct ? 4.0e-5 : 1.0e-5;
+    // 5x the old 1e-5 / 4e-5 kicks.
+    const double EPSILON = TopoCache::mesh->preferLbvhIsct ? 2.0e-4 : 5.0e-5;
     // Per-vertex splitmix: thread-safe, same magnitude as drand(-E,E)^3.
     // (std::rand is not safe to call from many threads.)
     const uint64_t seed = (uint64_t)std::rand() ^ 0xA5A5A5A5A5A5A5A5ULL;

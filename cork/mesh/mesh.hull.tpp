@@ -141,7 +141,7 @@ bool Mesh<VertData,TriData>::hasStackedDuplicateFaces() const
 
 template<class VertData, class TriData>
 void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *stats,
-                                       double leftoverAreaFrac)
+                                       double leftoverAreaFrac, bool exact)
 {
     using namespace cork_si;
     using namespace cork_hull;
@@ -378,8 +378,13 @@ void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *s
         n = n / nl;
         Vec3d ctr = (a + b + c) / 3.0;
         for (int s = 0; s < maxTries; ++s) {
+            if (exact && s >= 3) break;
             Vec3d d;
-            if (pile && s < 3) {
+            if (exact && s < 3) {
+                // Manifold PointWinding is +Z signed crossings.  +X/+Y are
+                // the same axis-aligned fallback when +Z grazes the face.
+                d = Vec3d(s == 2 ? 1.0 : 0.0, s == 1 ? 1.0 : 0.0, s == 0 ? 1.0 : 0.0);
+            } else if (pile && s < 3) {
                 d = Vec3d(s == 0 ? 1.0 : 0.0, s == 1 ? 1.0 : 0.0, s == 2 ? 1.0 : 0.0);
             } else {
                 uint64_t h0 = mix64(salt ^ ((uint64_t)f << 8) ^ (uint64_t)s);
