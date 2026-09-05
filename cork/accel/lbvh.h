@@ -43,6 +43,28 @@ inline bool overlapF(const BoxF &a, const BoxF &b) {
            a.mnz <= b.mxz && b.mnz <= a.mxz;
 }
 
+// Slab test. inv = 1/dir with a huge value on a zero component.
+inline bool rayHitBoxF(const Vec3d &p, const Vec3d &inv, const BoxF &b) {
+    double tmin = -1e300, tmax = 1e300;
+    const double mn[3] = { b.mnx, b.mny, b.mnz };
+    const double mx[3] = { b.mxx, b.mxy, b.mxz };
+    const double pv[3] = { p.x, p.y, p.z };
+    const double iv[3] = { inv.x, inv.y, inv.z };
+    for (int k = 0; k < 3; ++k) {
+        if (std::fabs(iv[k]) > 1e200) {
+            if (pv[k] < mn[k] || pv[k] > mx[k]) return false;
+            continue;
+        }
+        double t0 = (mn[k] - pv[k]) * iv[k];
+        double t1 = (mx[k] - pv[k]) * iv[k];
+        if (t0 > t1) std::swap(t0, t1);
+        if (t0 > tmin) tmin = t0;
+        if (t1 < tmax) tmax = t1;
+        if (tmax < tmin) return false;
+    }
+    return tmax >= 0.0;
+}
+
 inline uint32_t spread3(uint32_t v) {
     v = 0xFF0000FFu & (v * 0x00010001u);
     v = 0x0F00F00Fu & (v * 0x00000101u);
@@ -186,6 +208,46 @@ struct LBVH {
                 if (node == 1) break;
             }
         });
+    }
+
+    // Infinite ray from p with inv = 1/direction (huge if a component is 0).
+    // Calls fn(leafPrim[leaf]) for every leaf box the ray overlaps.
+    template<class Fn>
+    void ray(const Vec3d &p, const Vec3d &inv, Fn &&fn) const {
+        if (n <= 0) return;
+        if (n == 1) {
+            if (rayHitBoxF(p, inv, nodeBox[0])) fn(leafPrim[0]);
+            return;
+        }
+        int fixed[1024];
+        std::vector<int> extra;
+        int top = -1;
+        auto push = [&](int n) {
+            if (top + 1 < 1024) fixed[++top] = n;
+            else extra.push_back(n);
+        };
+        auto pop = [&]() -> int {
+            if (!extra.empty()) { int n = extra.back(); extra.pop_back(); return n; }
+            return fixed[top--];
+        };
+        int node = 1;
+        while (1) {
+            int in = node2internal(node);
+            int c1 = child1[in], c2 = child2[in];
+            bool t1 = rayHitBoxF(p, inv, nodeBox[c1]);
+            bool t2 = rayHitBoxF(p, inv, nodeBox[c2]);
+            int go1 = t1 && !isLeaf(c1);
+            int go2 = t2 && !isLeaf(c2);
+            if (t1 && isLeaf(c1)) fn(leafPrim[node2leaf(c1)]);
+            if (t2 && isLeaf(c2)) fn(leafPrim[node2leaf(c2)]);
+            if (!go1 && !go2) {
+                if (extra.empty() && top < 0) break;
+                node = pop();
+            } else {
+                node = go1 ? c1 : c2;
+                if (go1 && go2) push(c2);
+            }
+        }
     }
 
     // Call fn(leafPrim[leaf]) for every leaf whose box overlaps q.

@@ -11,12 +11,10 @@
 // |   1. faces are grouped into patches connected through manifold edges
 // |      (edges with exactly two incident faces); intersection curves and
 // |      other non-manifold edges separate patches
-// |   2. seed faces are sampled in every patch (more for larger patches).
-// |      From each seed's centroid rays are cast to both sides through a
-// |      uniform grid; the signed crossing count is the winding number w+
-// |      (normal side) and w- (back side).  The winding number jumps by
-// |      exactly one across a face, so w- == w+ + 1 is required, otherwise
-// |      the ray grazed an edge and another direction is tried.
+// |   2. seed faces per patch (more for larger patches).  Rays both ways
+// |      through the SI uniform grid on a normal soup, or our LBVH when
+// |      the arrangement is a sheet pile (NM edges / faces > 0.15).
+// |      Crossing count is w+ / w-; require w- == w+ + 1.
 // |   3. a face is kept if its normal side is exterior (w+ == 0), kept and
 // |      flipped if its back side is exterior (w- == 0), otherwise deleted.
 // |      If the seeds of a patch disagree (this happens where cork leaves a
@@ -35,6 +33,7 @@
 #include <algorithm>
 #include <mutex>
 #include <iostream>
+#include <unordered_map>
 
 namespace cork_hull {
 
@@ -80,6 +79,65 @@ inline int rayTriSign(const Vec3d &p, const Vec3d &d,
 enum : int8_t { HULL_UNSET = -1, HULL_KEEP = 0, HULL_FLIP = 1, HULL_DELETE = 2 };
 
 } // namespace cork_hull
+
+template<class VertData, class TriData>
+bool Mesh<VertData,TriData>::hasStackedDuplicateFaces() const
+{
+    const size_t nT = tris.size();
+    const size_t nV = verts.size();
+    if (nT == 0 || nV == 0) return false;
+    std::vector<int> deg(nV, 0);
+    for (size_t t = 0; t < nT; ++t) {
+        const Tri &tr = tris[t];
+        if (tr.a == tr.b || tr.b == tr.c || tr.c == tr.a) continue;
+        deg[tr.a]++; deg[tr.b]++; deg[tr.c]++;
+    }
+    // Stacked duplicate sheets make extreme fans (NM 20: 234).  slc 21's
+    // busiest vertex is a feature fan (~96) with manifold spokes — stop.
+    int vmax = 0;
+    for (int d : deg) if (d > vmax) vmax = d;
+    if (vmax < 100) return false;
+
+    std::vector<int> hotOf(nV, -1);
+    int nHot = 0;
+    for (size_t v = 0; v < nV; ++v)
+        if (deg[v] >= 100) hotOf[v] = nHot++;
+    if (nHot == 0) return false;
+
+    std::vector<int> start((size_t)nHot + 1, 0);
+    for (size_t v = 0; v < nV; ++v)
+        if (hotOf[v] >= 0) start[hotOf[v] + 1] += deg[v];
+    for (int i = 0; i < nHot; ++i) start[i + 1] += start[i];
+    std::vector<int> inc((size_t)start[nHot]);
+    std::vector<int> fill(start.begin(), start.end() - 1);
+    for (size_t t = 0; t < nT; ++t) {
+        const Tri &tr = tris[t];
+        if (tr.a == tr.b || tr.b == tr.c || tr.c == tr.a) continue;
+        const int vs[3] = { (int)tr.a, (int)tr.b, (int)tr.c };
+        for (int k = 0; k < 3; ++k)
+            if (hotOf[vs[k]] >= 0) inc[fill[hotOf[vs[k]]]++] = (int)t;
+    }
+    auto ek = [](int a, int b) -> uint64_t {
+        uint32_t u = (uint32_t)std::min(a, b), w = (uint32_t)std::max(a, b);
+        return ((uint64_t)u << 32) | w;
+    };
+    for (size_t v = 0; v < nV; ++v) {
+        const int h = hotOf[v];
+        if (h < 0) continue;
+        std::unordered_map<uint64_t, int> ec;
+        ec.reserve((size_t)deg[v] * 2);
+        for (int i = start[h]; i < start[h + 1]; ++i) {
+            const Tri &tr = tris[inc[i]];
+            const int vs[3] = { (int)tr.a, (int)tr.b, (int)tr.c };
+            for (int k = 0; k < 3; ++k) {
+                int a = vs[k], b = vs[(k + 1) % 3];
+                if (a != (int)v && b != (int)v) continue;
+                if (++ec[ek(a, b)] >= 8) return true;
+            }
+        }
+    }
+    return false;
+}
 
 template<class VertData, class TriData>
 void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *stats,
@@ -164,17 +222,23 @@ void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *s
     }
 
     // ------------------------------------------------------------------
-    // 2. uniform grid over faces (same machinery as the SI broad phase)
+    // 2. Spatial index for winding rays.
+    //    Normal soup (slc 21): uniform-grid DDA — cache-friendly on a
+    //    near-2-manifold.  Sheet pile (NM 20): LBVH — grid cells are
+    //    packed 30-deep and DDA hangs.  Switch on NM-edge density
+    //    after patches (free): pile if nNm/nFaces > 0.15 or nNm > 200k.
     // ------------------------------------------------------------------
+    const size_t nNm = nmStart.size() > 0 ? nmStart.size() - 1 : 0;
+    const bool pile = nNm > 200000 || (nt > 0 && nNm * 20 > nt * 3);
     RawArray<BBox3d> tb(nt);
     CellGrid grid;
     RawArray<uint64_t> ent;
     RawArray<uint32_t> cellStart;
-    size_t ncells = 0;
+    cork_lbvh::LBVH tree;
     double cellH = 1.0;
     double tMin = 0.0;
     {
-        CORK_PROF("  hull: grid");
+        CORK_PROF(pile ? "  hull: lbvh" : "  hull: grid");
         struct Acc { BBox3d box; double sum = 0.0; };
         cork_par::Local<Acc> acc;
         cork_par::for_range(nt, 8192, [&](size_t b0, size_t b1) {
@@ -194,90 +258,111 @@ void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *s
         BBox3d world; double meanExt = 0.0;
         acc.combine_each([&](const Acc &a) { world = convex(world, a.box); meanExt += a.sum; });
         meanExt /= (double)nt;
-
         Vec3d ext = world.maxp - world.minp;
         double maxExt = std::max(ext.x, std::max(ext.y, ext.z));
-        double h = 3.0 * meanExt;
-        if (!(h > 0.0)) h = (maxExt > 0.0) ? maxExt : 1.0;
-        for (;;) {
-            long long nx = std::max(1LL, (long long)std::ceil(ext.x / h) + 1);
-            long long ny = std::max(1LL, (long long)std::ceil(ext.y / h) + 1);
-            long long nz = std::max(1LL, (long long)std::ceil(ext.z / h) + 1);
-            if (nx * ny * nz <= (1LL << 24)) { grid.nx = (int)nx; grid.ny = (int)ny; grid.nz = (int)nz; break; }
-            h *= 1.25;
-        }
-        cellH = h;
         tMin = 1e-13 * std::max(maxExt, 1.0);
-        double pad = 1e-9 * std::max(maxExt, 1.0);
-        grid.org = world.minp - Vec3d(pad, pad, pad);
-        grid.inv = Vec3d(1.0 / h, 1.0 / h, 1.0 / h);
-        ncells = (size_t)grid.nx * grid.ny * grid.nz;
-
-        buildEntries(grid, tb, ent);
-        const size_t ne = ent.size();
-        cellStart.alloc(ncells + 1);
-        cork_par::for_each_idx(ncells + 1, 65536, [&](size_t c) { cellStart[c] = ~0u; });
-        cork_par::for_each_idx(ne, 16384, [&](size_t i) {
-            if (i == 0 || entryKey(ent[i]) != entryKey(ent[i - 1]))
-                cellStart[entryKey(ent[i])] = (uint32_t)i;
-        });
-        cellStart[ncells] = (uint32_t)ne;
-        for (size_t c = ncells; c-- > 0;)
-            if (cellStart[c] == ~0u) cellStart[c] = cellStart[c + 1];
         cork_prof::note("  hull: #patches", (double)np);
-        cork_prof::note("  hull: #grid entries", (double)ne);
+        cork_prof::note("  hull: #nm edges", (double)nNm);
+        if (pile) {
+            tree.build(tb.data(), nt, world);
+            cork_prof::note("  hull: #lbvh leaves", (double)tree.n);
+        } else {
+            double h = 3.0 * meanExt;
+            if (!(h > 0.0)) h = (maxExt > 0.0) ? maxExt : 1.0;
+            for (;;) {
+                long long nx = std::max(1LL, (long long)std::ceil(ext.x / h) + 1);
+                long long ny = std::max(1LL, (long long)std::ceil(ext.y / h) + 1);
+                long long nz = std::max(1LL, (long long)std::ceil(ext.z / h) + 1);
+                if (nx * ny * nz <= (1LL << 24)) {
+                    grid.nx = (int)nx; grid.ny = (int)ny; grid.nz = (int)nz;
+                    break;
+                }
+                h *= 1.25;
+            }
+            cellH = h;
+            double pad = 1e-9 * std::max(maxExt, 1.0);
+            grid.org = world.minp - Vec3d(pad, pad, pad);
+            grid.inv = Vec3d(1.0 / h, 1.0 / h, 1.0 / h);
+            const size_t ncells = (size_t)grid.nx * grid.ny * grid.nz;
+            buildEntries(grid, tb, ent);
+            const size_t ne = ent.size();
+            cellStart.alloc(ncells + 1);
+            cork_par::for_each_idx(ncells + 1, 65536, [&](size_t c) { cellStart[c] = ~0u; });
+            cork_par::for_each_idx(ne, 16384, [&](size_t i) {
+                if (i == 0 || entryKey(ent[i]) != entryKey(ent[i - 1]))
+                    cellStart[entryKey(ent[i])] = (uint32_t)i;
+            });
+            cellStart[ncells] = (uint32_t)ne;
+            for (size_t c = ncells; c-- > 0;)
+                if (cellStart[c] == ~0u) cellStart[c] = cellStart[c + 1];
+            cork_prof::note("  hull: #grid entries", (double)ne);
+        }
     }
 
     // ------------------------------------------------------------------
-    // 3. winding numbers by ray casting (3D-DDA through the grid)
+    // 3. winding numbers by ray casting
     // ------------------------------------------------------------------
-    // returns false if the ray was rejected (grazing hit)
-    auto castWinding = [&](const Vec3d &p, const Vec3d &d, uint32_t skip,
-                           std::vector<std::pair<uint32_t,int>> &hits, int &w) -> bool
-    {
-        hits.clear();
-        int ix, iy, iz;
-        grid.cellOf(p, ix, iy, iz);
-        int    step[3];
-        double tMax[3], tDelta[3];
-        const double dv[3] = { d.x, d.y, d.z };
-        const int    ic[3] = { ix, iy, iz };
-        const int    nn[3] = { grid.nx, grid.ny, grid.nz };
-        const double pv[3] = { p.x, p.y, p.z };
-        const double ov[3] = { grid.org.x, grid.org.y, grid.org.z };
-        for (int k = 0; k < 3; ++k) {
-            if (dv[k] > 0)      { step[k] = 1;  tMax[k] = (ov[k] + (ic[k] + 1) * cellH - pv[k]) / dv[k]; tDelta[k] = cellH / dv[k]; }
-            else if (dv[k] < 0) { step[k] = -1; tMax[k] = (ov[k] + ic[k] * cellH - pv[k]) / dv[k];       tDelta[k] = -cellH / dv[k]; }
-            else                { step[k] = 0;  tMax[k] = INFINITY; tDelta[k] = INFINITY; }
-        }
-        int cur[3] = { ix, iy, iz };
-        for (;;) {
-            uint32_t key = grid.key(cur[0], cur[1], cur[2]);
-            for (uint32_t e = cellStart[key]; e < cellStart[key + 1]; ++e) {
-                uint32_t tid = entryIdx(ent[e]);
-                if (tid == skip) continue;
-                const Tri &t = tris[tid];
-                double tt;
-                int s = rayTriSign(p, d, verts[t.a].pos, verts[t.b].pos, verts[t.c].pos, tt, tMin);
-                if (s != 0) hits.push_back({tid, s});
-            }
-            int ax = (tMax[0] < tMax[1]) ? ((tMax[0] < tMax[2]) ? 0 : 2) : ((tMax[1] < tMax[2]) ? 1 : 2);
-            cur[ax] += step[ax];
-            if (cur[ax] < 0 || cur[ax] >= nn[ax]) break;
-            tMax[ax] += tDelta[ax];
-        }
+    auto finishHits = [&](std::vector<std::pair<uint32_t,int>> &hits, int &w) -> bool {
         std::sort(hits.begin(), hits.end());
         w = 0;
         for (size_t i = 0; i < hits.size();) {
             size_t j = i + 1;
             while (j < hits.size() && hits[j].first == hits[i].first) ++j;
-            // same face reached from several cells: count once; if the signs
-            // disagree something numerically odd happened -> reject the ray
             for (size_t k = i + 1; k < j; ++k) if (hits[k].second != hits[i].second) return false;
             w += hits[i].second;
             i = j;
         }
         return true;
+    };
+    auto castWinding = [&](const Vec3d &p, const Vec3d &d, uint32_t skip,
+                           std::vector<std::pair<uint32_t,int>> &hits, int &w) -> bool
+    {
+        hits.clear();
+        if (pile) {
+            const Vec3d inv(
+                (std::fabs(d.x) > 1e-300) ? 1.0 / d.x : (d.x >= 0.0 ? 1e300 : -1e300),
+                (std::fabs(d.y) > 1e-300) ? 1.0 / d.y : (d.y >= 0.0 ? 1e300 : -1e300),
+                (std::fabs(d.z) > 1e-300) ? 1.0 / d.z : (d.z >= 0.0 ? 1e300 : -1e300));
+            tree.ray(p, inv, [&](uint32_t tid) {
+                if (tid == skip) return;
+                const Tri &t = tris[tid];
+                double tt;
+                int s = rayTriSign(p, d, verts[t.a].pos, verts[t.b].pos, verts[t.c].pos, tt, tMin);
+                if (s != 0) hits.push_back({tid, s});
+            });
+        } else {
+            int ix, iy, iz;
+            grid.cellOf(p, ix, iy, iz);
+            int    step[3];
+            double tMax[3], tDelta[3];
+            const double dv[3] = { d.x, d.y, d.z };
+            const int    ic[3] = { ix, iy, iz };
+            const int    nn[3] = { grid.nx, grid.ny, grid.nz };
+            const double pv[3] = { p.x, p.y, p.z };
+            const double ov[3] = { grid.org.x, grid.org.y, grid.org.z };
+            for (int k = 0; k < 3; ++k) {
+                if (dv[k] > 0)      { step[k] = 1;  tMax[k] = (ov[k] + (ic[k] + 1) * cellH - pv[k]) / dv[k]; tDelta[k] = cellH / dv[k]; }
+                else if (dv[k] < 0) { step[k] = -1; tMax[k] = (ov[k] + ic[k] * cellH - pv[k]) / dv[k];       tDelta[k] = -cellH / dv[k]; }
+                else                { step[k] = 0;  tMax[k] = INFINITY; tDelta[k] = INFINITY; }
+            }
+            int cur[3] = { ix, iy, iz };
+            for (;;) {
+                uint32_t key = grid.key(cur[0], cur[1], cur[2]);
+                for (uint32_t e = cellStart[key]; e < cellStart[key + 1]; ++e) {
+                    uint32_t tid = entryIdx(ent[e]);
+                    if (tid == skip) continue;
+                    const Tri &t = tris[tid];
+                    double tt;
+                    int s = rayTriSign(p, d, verts[t.a].pos, verts[t.b].pos, verts[t.c].pos, tt, tMin);
+                    if (s != 0) hits.push_back({tid, s});
+                }
+                int ax = (tMax[0] < tMax[1]) ? ((tMax[0] < tMax[2]) ? 0 : 2) : ((tMax[1] < tMax[2]) ? 1 : 2);
+                cur[ax] += step[ax];
+                if (cur[ax] < 0 || cur[ax] >= nn[ax]) break;
+                tMax[ax] += tDelta[ax];
+            }
+        }
+        return finishHits(hits, w);
     };
 
     // classify one face by its own winding numbers; HULL_UNSET if no
@@ -293,12 +378,17 @@ void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *s
         n = n / nl;
         Vec3d ctr = (a + b + c) / 3.0;
         for (int s = 0; s < maxTries; ++s) {
-            uint64_t h0 = mix64(salt ^ ((uint64_t)f << 8) ^ (uint64_t)s);
-            uint64_t h1 = mix64(h0), h2 = mix64(h1);
-            Vec3d d(unit01(h0) * 2.0 - 1.0, unit01(h1) * 2.0 - 1.0, unit01(h2) * 2.0 - 1.0);
-            double dl = len(d);
-            if (!(dl > 1e-3)) continue;
-            d = d / dl;
+            Vec3d d;
+            if (pile && s < 3) {
+                d = Vec3d(s == 0 ? 1.0 : 0.0, s == 1 ? 1.0 : 0.0, s == 2 ? 1.0 : 0.0);
+            } else {
+                uint64_t h0 = mix64(salt ^ ((uint64_t)f << 8) ^ (uint64_t)s);
+                uint64_t h1 = mix64(h0), h2 = mix64(h1);
+                d = Vec3d(unit01(h0) * 2.0 - 1.0, unit01(h1) * 2.0 - 1.0, unit01(h2) * 2.0 - 1.0);
+                double dl = len(d);
+                if (!(dl > 1e-3)) continue;
+                d = d / dl;
+            }
             double cs = dot(d, n);
             if (cs < 0.0) { d = -d; cs = -cs; }
             if (cs < 0.15) continue;                 // avoid grazing the face itself
@@ -347,7 +437,13 @@ void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *s
             while (nc < size && area[faces[nc]] >= 0.1 * amax) ++nc;
             nc = std::max<size_t>(nc, std::max<size_t>(1, size / 4));
             ncand[p] = (uint32_t)nc;
-            size_t S = flood ? 1 : std::max<size_t>(5, nc / 50);
+            // Pile: ray the real sheets first (size >= 16).  Slivers follow
+            // by topology, then a 1-seed fallback if still UNSET.
+            size_t S;
+            if (flood) S = 1;
+            else if (pile && size < 16) S = 0;
+            else if (pile) S = 1;
+            else S = std::max<size_t>(5, nc / 50);
             if (S > 65536) S = 65536;
             if (S > nc) S = nc;
             sstart[p + 1] = sstart[p] + (uint32_t)S;
@@ -357,6 +453,7 @@ void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *s
             const uint32_t *faces = &plist[pstart[p]];
             size_t nc = ncand[p];
             size_t S = sstart[p + 1] - sstart[p];
+            if (S == 0) return;
             uint32_t *out = &seedFace[sstart[p]];
             if (S >= nc) { for (size_t i = 0; i < nc; ++i) out[i] = faces[i]; }
             else {

@@ -261,6 +261,11 @@ public: // OUTER HULL module (single mesh; call after resolveIntersections)
     // flipping faces whose *back* side is exterior.  See mesh.hull.tpp.
     void outerHull(int raysPerPatch = 5, cork_hull::HullStats *stats = nullptr,
                    double leftoverAreaFrac = 0.0);
+    // True if a busy vertex has an edge used 8+ times (stacked duplicate
+    // faces).  Cheap; no mesh copy.  Used to decide pre-SI dup drop.
+    bool hasStackedDuplicateFaces() const;
+    // Sheet-pile soups: LBVH SI instead of packed-grid 336M cell pairs.
+    bool preferLbvhIsct = false;
 
 public: // BOOLean operation module
     // all of the form

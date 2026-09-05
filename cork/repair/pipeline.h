@@ -17,9 +17,14 @@ public:
     static void run_piece(CorkMesh &mesh, const Options &opt) {
         if (opt.clean) drop_degen_unref(mesh);
         // Mira: drop tiny/dup scraps before cork or it can hang / exit(1).
-        // Tiny/dup walk is hull leftover's job when hull is on. Mira only
-        // remove_noise's before cork on the already-split easy piece.
+        // Hull path: only drop exact dups when a busy vertex has an edge
+        // used 8+ times (NM 20 valence-52).  slc 21 has busy verts but
+        // manifold spokes — skip the FaceKey walk.
         if (opt.noise && !opt.hull) drop_noise(mesh, opt.minFaces, 0.0);
+        else if (opt.noise && opt.hull && mesh.hasStackedDuplicateFaces()) {
+            drop_noise(mesh, opt.minFaces, 0.0, /*dropTiny=*/false);
+            mesh.preferLbvhIsct = true;
+        }
         if (opt.perturb) perturb_along_normals(mesh, opt.perturbIntensity);
         if (opt.resolve) {
             CORK_PROF("repair.resolve");

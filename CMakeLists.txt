@@ -32,12 +32,14 @@ option(CORK_ISPC "Compile ISPC AVX2 bbox batch kernel" ON)
 include(FetchContent)
 
 if(CORK_TBB)
-    # Use a locally vendored oneTBB tree (no network / remote fetch).
-    # Expected at external/oneTBB (copy from a prior FetchContent tbb-src if needed).
-    set(_CORK_TBB_SRC "${CMAKE_SOURCE_DIR}/external/oneTBB")
+    # Local oneTBB only (no network). Mira setup.bat copies build/_deps/tbb-src here.
+    set(_CORK_TBB_SRC "${CMAKE_CURRENT_SOURCE_DIR}/external/oneTBB")
     if(NOT EXISTS "${_CORK_TBB_SRC}/CMakeLists.txt")
-        message(FATAL_ERROR "CORK_TBB enabled but external/oneTBB is missing. Place a local oneTBB source tree there.")
+        message(WARNING "CORK_TBB on but external/oneTBB missing — building without TBB")
+        set(CORK_TBB OFF)
     endif()
+endif()
+if(CORK_TBB)
     FetchContent_Declare(
         tbb
         SOURCE_DIR ${_CORK_TBB_SRC}

@@ -242,6 +242,80 @@ inline void com_perturb(Shell &s, const Vec3d &clusterCom, double intensity) {
     measure(s);
 }
 
+// Stacked-sheet soups only: SI the AABB-overlapping groups, pass the
+// disjoint shells through a single hull.  Full-soup cork was 1.3s of
+// 30-sheet hits plus 129 easy parts that never needed SI.
+inline void pile_split_repair(CorkMesh &mesh, const Options &opt) {
+    CORK_PROF("repair.pile_split");
+    std::vector<Shell> shells = split_shells(mesh.raw(), std::max(1, opt.minFaces));
+    if (shells.size() <= 1) {
+        if (opt.resolve) mesh.resolveIntersections();
+        if (opt.hull) {
+            cork_hull::HullStats hs;
+            mesh.outerHull(opt.raysPerPatch, &hs, opt.noise ? opt.noiseAreaFrac : 0.0);
+            if (!hs.closed) fill_boundary_loops(mesh);
+        }
+        return;
+    }
+    auto groups = aabb_clusters(shells);
+    Raw easy;
+    std::vector<std::vector<int>> hard;
+    for (auto &g : groups) {
+        if (g.size() <= 1) {
+            if (easy.triangles.empty())
+                easy = std::move(shells[g[0]].raw);
+            else
+                easy = concat_raw(std::move(easy), shells[g[0]].raw);
+        } else {
+            hard.push_back(std::move(g));
+        }
+    }
+    cork_prof::note("  pile shells", (double)shells.size());
+    cork_prof::note("  pile hard groups", (double)hard.size());
+
+    Raw acc;
+    bool have = false;
+    auto take = [&](CorkMesh &&m) {
+        Raw r = m.raw();
+        if (!have) {
+            acc = std::move(r);
+            have = true;
+        } else {
+            acc = concat_raw(std::move(acc), r);
+        }
+    };
+    auto finish = [&](CorkMesh &m, bool resolve) {
+        if (resolve && opt.resolve) {
+            m.preferLbvhIsct = true;
+            m.resolveIntersections();
+        }
+        if (opt.hull) {
+            cork_hull::HullStats hs;
+            m.outerHull(opt.raysPerPatch, &hs, opt.noise ? opt.noiseAreaFrac : 0.0);
+            if (!hs.closed) fill_boundary_loops(m);
+        }
+    };
+    for (auto &g : hard) {
+        Raw r;
+        for (int i : g) {
+            if (r.triangles.empty())
+                r = shells[i].raw;
+            else
+                r = concat_raw(std::move(r), shells[i].raw);
+        }
+        if (r.triangles.empty()) continue;
+        CorkMesh part(std::move(r));
+        finish(part, true);
+        take(std::move(part));
+    }
+    if (!easy.triangles.empty()) {
+        CorkMesh part(std::move(easy));
+        finish(part, false);
+        take(std::move(part));
+    }
+    if (have) adopt(mesh, std::move(acc));
+}
+
 inline Raw concat_indices(const std::vector<Shell> &shells, const std::vector<int> &idx) {
     Raw acc;
     for (int i : idx) {
