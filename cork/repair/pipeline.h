@@ -46,6 +46,9 @@ public:
             CORK_PROF("repair.hull");
             cork_hull::HullStats hs;
             extract_hull(mesh, opt, &hs);
+            // Hull leftover prune misses dust that is not a boundary sliver
+            // of a kept patch (26: 1128 comps → 2). slc 21 is 1 shell.
+            if (opt.noise) drop_small_shells(mesh, opt.noiseAreaFrac);
             needFill = !hs.closed;
         } else if (opt.hull && opt.deferHull) {
             needFill = false;

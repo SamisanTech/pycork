@@ -265,8 +265,8 @@ public: // OUTER HULL module (single mesh; call after resolveIntersections)
     // (+Z, then +X/+Y).  Opt-in; default path stays random-ray outerHull().
     void outerHullExact(cork_hull::HullStats *stats = nullptr,
                         double leftoverAreaFrac = 0.0);
-    // True if a busy vertex has an edge used 8+ times (stacked duplicate
-    // faces).  Cheap; no mesh copy.  Used to decide pre-SI dup drop.
+    // True if face-valence >= 100 and some undirected edge is used 8+
+    // times (stacked duplicate sheets).  slc 21 is vmax=96 / emax=4.
     bool hasStackedDuplicateFaces() const;
     // Sheet-pile soups: LBVH SI instead of packed-grid 336M cell pairs.
     bool preferLbvhIsct = false;

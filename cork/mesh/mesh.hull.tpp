@@ -92,49 +92,29 @@ bool Mesh<VertData,TriData>::hasStackedDuplicateFaces() const
         if (tr.a == tr.b || tr.b == tr.c || tr.c == tr.a) continue;
         deg[tr.a]++; deg[tr.b]++; deg[tr.c]++;
     }
-    // Stacked duplicate sheets make extreme fans (NM 20: 234).  slc 21's
-    // busiest vertex is a feature fan (~96) with manifold spokes — stop.
+    // Stacked duplicate sheets make extreme fans (NM 20: 234, NM 26: 160).
+    // slc 21's busiest vertex is a feature fan (~96) with manifold spokes
+    // and emax=4 — stop before any edge walk.
     int vmax = 0;
     for (int d : deg) if (d > vmax) vmax = d;
     if (vmax < 100) return false;
 
-    std::vector<int> hotOf(nV, -1);
-    int nHot = 0;
-    for (size_t v = 0; v < nV; ++v)
-        if (deg[v] >= 100) hotOf[v] = nHot++;
-    if (nHot == 0) return false;
-
-    std::vector<int> start((size_t)nHot + 1, 0);
-    for (size_t v = 0; v < nV; ++v)
-        if (hotOf[v] >= 0) start[hotOf[v] + 1] += deg[v];
-    for (int i = 0; i < nHot; ++i) start[i + 1] += start[i];
-    std::vector<int> inc((size_t)start[nHot]);
-    std::vector<int> fill(start.begin(), start.end() - 1);
+    // Any undirected edge used 8+ times. NM 26 has 111 such edges, none
+    // of them incident to the valence>=100 verts, so a hot-vert-only
+    // scan missed the pile and Triangle later exit(1)'d.
+    auto ek = [](int a, int b) -> uint64_t {
+        uint32_t u = (uint32_t)std::min(a, b), w = (uint32_t)std::max(a, b);
+        return ((uint64_t)u << 32) | w;
+    };
+    std::unordered_map<uint64_t, int> ec;
+    ec.reserve(nT * 2);
     for (size_t t = 0; t < nT; ++t) {
         const Tri &tr = tris[t];
         if (tr.a == tr.b || tr.b == tr.c || tr.c == tr.a) continue;
         const int vs[3] = { (int)tr.a, (int)tr.b, (int)tr.c };
         for (int k = 0; k < 3; ++k)
-            if (hotOf[vs[k]] >= 0) inc[fill[hotOf[vs[k]]]++] = (int)t;
-    }
-    auto ek = [](int a, int b) -> uint64_t {
-        uint32_t u = (uint32_t)std::min(a, b), w = (uint32_t)std::max(a, b);
-        return ((uint64_t)u << 32) | w;
-    };
-    for (size_t v = 0; v < nV; ++v) {
-        const int h = hotOf[v];
-        if (h < 0) continue;
-        std::unordered_map<uint64_t, int> ec;
-        ec.reserve((size_t)deg[v] * 2);
-        for (int i = start[h]; i < start[h + 1]; ++i) {
-            const Tri &tr = tris[inc[i]];
-            const int vs[3] = { (int)tr.a, (int)tr.b, (int)tr.c };
-            for (int k = 0; k < 3; ++k) {
-                int a = vs[k], b = vs[(k + 1) % 3];
-                if (a != (int)v && b != (int)v) continue;
-                if (++ec[ek(a, b)] >= 8) return true;
-            }
-        }
+            if (++ec[ek(vs[k], vs[(k + 1) % 3])] >= 8)
+                return true;
     }
     return false;
 }
