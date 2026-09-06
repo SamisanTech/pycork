@@ -26,7 +26,13 @@ public:
             mesh.preferLbvhIsct = true;
         }
         if (opt.perturb) perturb_along_normals(mesh, opt.perturbIntensity);
-        if (opt.resolve) {
+        // Compact stacked pile (NM 26: 2.9M in a 22mm AABB). Full resolve
+        // shreds to ~76M faces (~289s) and leaves a 23k-open belt. Hull
+        // the dup-dropped soup instead (LBVH). NM 20 is 328k — resolves.
+        // slc 21 never preferLbvhIsct.
+        const bool compactPile =
+            mesh.preferLbvhIsct && mesh.numTris() > 1000000;
+        if (opt.resolve && !compactPile) {
             CORK_PROF("repair.resolve");
             auto go = [&]() {
                 if (opt.si_subset) resolve_si_subset(mesh);
@@ -35,7 +41,6 @@ public:
             try {
                 go();
             } catch (const std::exception &) {
-                // Mira: "if the noise is kept, cork crashes"
                 drop_noise(mesh, opt.minFaces);
                 go();
             }
@@ -46,20 +51,19 @@ public:
             CORK_PROF("repair.hull");
             cork_hull::HullStats hs;
             extract_hull(mesh, opt, &hs);
-            // Hull leftover prune misses dust that is not a boundary sliver
-            // of a kept patch (26: 1128 comps → 2). slc 21 is 1 shell.
-            if (opt.noise) drop_small_shells(mesh, opt.noiseAreaFrac);
+            // 21 is one closed shell — the FaceKey/UF walk is a ~0.6s no-op.
+            // Pile path (20/26) still drops leftover dust.
+            if (opt.noise && mesh.preferLbvhIsct)
+                drop_small_shells(mesh, opt.noiseAreaFrac);
             needFill = !hs.closed;
         } else if (opt.hull && opt.deferHull) {
             needFill = false;
         } else if (opt.noise) {
             drop_small_shells(mesh, opt.noiseAreaFrac);
         }
-        // close_leftover (weld+puzzle+fill) is opt.puzzle — leftover split
-        // on a 100k+ soup is seconds and did not close these rims.
         if (needFill && opt.fill) {
             if (opt.puzzle) close_leftover(mesh, opt, nullptr);
-            else fill_boundary_loops(mesh);
+            else fill_boundary_loops(mesh, compactPile);
         }
     }
 

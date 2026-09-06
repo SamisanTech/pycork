@@ -209,7 +209,10 @@ void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *s
     //    after patches (free): pile if nNm/nFaces > 0.15 or nNm > 200k.
     // ------------------------------------------------------------------
     const size_t nNm = nmStart.size() > 0 ? nmStart.size() - 1 : 0;
-    const bool pile = nNm > 200000 || (nt > 0 && nNm * 20 > nt * 3);
+    // preferLbvhIsct: compact pile after dup-drop still has nNm/nF ~ 0.01
+    // (26: 36k NM / 2.9M). Density gate would pick grid DDA and hang.
+    const bool pile = preferLbvhIsct || nNm > 200000 ||
+                      (nt > 0 && nNm * 20 > nt * 3);
     RawArray<BBox3d> tb(nt);
     CellGrid grid;
     RawArray<uint64_t> ent;
@@ -665,7 +668,7 @@ void Mesh<VertData,TriData>::outerHull(int raysPerPatch, cork_hull::HullStats *s
     // Cork isClosed() is directed: each edge (a→b)+1, (b→a)−1.
     // Undirected valence-2 can still fail isSolid if neighbors agree.
     // One BFS on the last kept graph — same cost class as one prune pass.
-    if (hullClosed) {
+    if (hullClosed && preferLbvhIsct) {
         CORK_PROF("  hull: orient (cork isClosed)");
         std::vector<uint32_t> kept;
         kept.reserve(nt);

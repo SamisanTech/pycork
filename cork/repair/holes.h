@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -16,7 +17,72 @@
 namespace cork {
 namespace repair {
 
-inline int fill_boundary_loops(CorkMesh &mesh) {
+// Planar ear-clip. Not a centroid star — used only for compact-pile
+// leftover rims (NM 26: two ~680-gons are almost all remaining opens).
+inline bool earclip_ring(const Raw &raw, const std::vector<int> &ring,
+                         const std::function<void(int, int, int)> &add_tri) {
+    const int n0 = (int)ring.size();
+    if (n0 < 4 || n0 > 2048) return false;
+    Vec3d nrm(0, 0, 0);
+    for (int i = 0; i < n0; ++i) {
+        const Vec3d &a = raw.vertices[ring[i]].pos;
+        const Vec3d &b = raw.vertices[ring[(i + 1) % n0]].pos;
+        nrm += cross(a, b);
+    }
+    const double nl = len(nrm);
+    if (!(nl > 1e-30)) return false;
+    nrm = nrm / nl;
+    Vec3d u = (std::fabs(nrm.x) < 0.9) ? Vec3d(1, 0, 0) : Vec3d(0, 1, 0);
+    u = normalized(cross(nrm, u));
+    const Vec3d v = cross(nrm, u);
+    std::vector<int> idx = ring;
+    std::vector<Vec2d> q((size_t)n0);
+    double area = 0;
+    for (int i = 0; i < n0; ++i) {
+        const Vec3d w = raw.vertices[ring[i]].pos - raw.vertices[ring[0]].pos;
+        q[i] = Vec2d(dot(w, u), dot(w, v));
+        const Vec2d &a = q[i], &b = q[(i + 1) % n0];
+        area += a.x * b.y - a.y * b.x;
+    }
+    auto prev = [&](int i, int n) { return (i + n - 1) % n; };
+    auto nxt = [&](int i, int n) { return (i + 1) % n; };
+    auto orient = [&](const Vec2d &a, const Vec2d &b, const Vec2d &c) {
+        return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    };
+    const double sgn = (area >= 0.0) ? 1.0 : -1.0;
+    auto inside = [&](const Vec2d &p, const Vec2d &a, const Vec2d &b, const Vec2d &c) {
+        const double o1 = sgn * orient(a, b, p);
+        const double o2 = sgn * orient(b, c, p);
+        const double o3 = sgn * orient(c, a, p);
+        return o1 >= -1e-12 && o2 >= -1e-12 && o3 >= -1e-12;
+    };
+    int guard = n0 * n0 + 8;
+    while ((int)idx.size() > 3 && guard-- > 0) {
+        const int n = (int)idx.size();
+        bool clipped = false;
+        for (int i = 0; i < n; ++i) {
+            const int ip = prev(i, n), in = nxt(i, n);
+            if (sgn * orient(q[ip], q[i], q[in]) <= 1e-14) continue;
+            bool empty = true;
+            for (int j = 0; j < n; ++j) {
+                if (j == ip || j == i || j == in) continue;
+                if (inside(q[j], q[ip], q[i], q[in])) { empty = false; break; }
+            }
+            if (!empty) continue;
+            add_tri(idx[ip], idx[i], idx[in]);
+            idx.erase(idx.begin() + i);
+            q.erase(q.begin() + i);
+            clipped = true;
+            break;
+        }
+        if (!clipped) return false;
+    }
+    if (idx.size() != 3) return false;
+    add_tri(idx[0], idx[1], idx[2]);
+    return true;
+}
+
+inline int fill_boundary_loops(CorkMesh &mesh, bool earclipLong = false) {
     CORK_PROF("repair.fill_holes");
     Raw raw = mesh.raw();
     const size_t nT0 = raw.triangles.size();
@@ -105,7 +171,11 @@ inline int fill_boundary_loops(CorkMesh &mesh) {
         }
         // Mira puzzle: fillholes_nc only when hole verts <= 20.
         // Star-capping a leftover hull rim (hundreds of verts) wrecks volume.
-        if (ring.size() > 20) continue;
+        // Compact pile (26): two ~680-gons are the leftover opens — earclip.
+        if (ring.size() > 20) {
+            if (earclipLong && earclip_ring(raw, ring, add_tri)) continue;
+            continue;
+        }
 
         // centroid-star (TMesh StarTriangulateHole purpose)
         CorkVertex cv;
