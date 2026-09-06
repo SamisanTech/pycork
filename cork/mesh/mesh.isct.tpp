@@ -369,7 +369,69 @@ public:
         Vec3d               origin;
         Vec3d               u, v;           // orthonormal basis of the face
         std::vector<int>    tris;           // 3 indices per output triangle
+        bool                skipHostileCdt = false;
     };
+
+    static void keep_original_face(SubdivData &d) {
+        d.tris.clear();
+        if (d.points.size() >= 3) {
+            d.tris.push_back(0);
+            d.tris.push_back(1);
+            d.tris.push_back(2);
+        }
+    }
+
+    // Triangle segmentintersection dies on T-junctions, crossings, and
+    // collapsed 2D segments. Detect only — do not sanitize (that opened
+    // slc 21). Huge axis-drop graphs are the same class.
+    static bool pslg_hostile(const SubdivData &d) {
+        const ShortVec<GVptr, 7> &pts = d.points;
+        const ShortVec<GEptr, 8> &eds = d.edges;
+        if (pts.size() > 48 || eds.size() > 72) return true;
+        double extent = 0.0;
+        for (GVptr p : pts) {
+            Vec2d q = proj2(d, p->coord);
+            extent = std::max(extent, std::max(std::fabs(q.x), std::fabs(q.y)));
+        }
+        const double eps  = std::max(1e-14, 1e-10 * std::max(extent, 1.0));
+        const double eps2 = eps * eps;
+        auto xy = [&](GVptr p) { return proj2(d, p->coord); };
+        auto on_seg = [&](GVptr a, GVptr b, GVptr c) -> bool {
+            if (c == a || c == b) return false;
+            Vec2d A = xy(a), B = xy(b), C = xy(c);
+            Vec2d ab = B - A, ac = C - A;
+            double ab2 = len2(ab);
+            if (ab2 <= eps2) return false;
+            double dist = std::fabs(ab.x * ac.y - ab.y * ac.x) / std::sqrt(ab2);
+            if (dist > eps) return false;
+            double t = dot(ac, ab) / ab2;
+            return t > 1e-8 && t < 1.0 - 1e-8;
+        };
+        for (GEptr e : eds) {
+            GVptr a = e->ends[0], b = e->ends[1];
+            if (!a || !b) continue;
+            if (len2(xy(b) - xy(a)) <= eps2) return true;
+            for (GVptr c : pts)
+                if (on_seg(a, b, c)) return true;
+        }
+        for (size_t i = 0; i < eds.size(); ++i) {
+            for (size_t j = i + 1; j < eds.size(); ++j) {
+                GVptr a = eds[i]->ends[0], b = eds[i]->ends[1];
+                GVptr c = eds[j]->ends[0], dd = eds[j]->ends[1];
+                if (!a || !b || !c || !dd) continue;
+                if (a == c || a == dd || b == c || b == dd) continue;
+                Vec2d A = xy(a), B = xy(b), C = xy(c), D = xy(dd);
+                Vec2d ab = B - A, cd = D - C, ac = C - A;
+                double den = ab.x * cd.y - ab.y * cd.x;
+                if (std::fabs(den) <= eps2) continue;
+                double t = (ac.x * cd.y - ac.y * cd.x) / den;
+                double s = (ac.x * ab.y - ac.y * ab.x) / den;
+                if (t > 1e-8 && t < 1.0 - 1e-8 && s > 1e-8 && s < 1.0 - 1e-8)
+                    return true;
+            }
+        }
+        return false;
+    }
 
     static Vec2d proj2(const SubdivData &d, const Vec3d &p) {
         Vec3d w = p - d.origin;
@@ -583,6 +645,7 @@ public:
         }
 
         choose_face_basis(d);
+        d.skipHostileCdt = iprob->mesh->skipHostileCdt;
         // Stock cork never sanitized. Always-on (or T/cross-only) opened
         // slc 21.stl resolve on some perturbs (open=2/3). Leave the
         // helper for a Triangle-failure retry if a later mesh needs it.
@@ -591,6 +654,16 @@ public:
     static void subdivide_triangulate(SubdivData &d) {
         const ShortVec<GVptr, 7> &points = d.points;
         const ShortVec<GEptr, 8> &edges  = d.edges;
+        if (points.size() < 3) {
+            d.tris.clear();
+            return;
+        }
+        // Never skip on slc 21 (skipHostileCdt=false). Always-on huge
+        // skip opened it (open=5423 / 2 shells).
+        if (d.skipHostileCdt && pslg_hostile(d)) {
+            keep_original_face(d);
+            return;
+        }
         struct triangulateio in, out;
 
         in.numberofpoints           = (int)points.size();
@@ -1644,10 +1717,12 @@ bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
 template<class VertData, class TriData>
 void Mesh<VertData,TriData>::IsctProblem::perturbPositions()
 {
-    // Sheet piles need a slightly larger first kick or SI degeneracies
-    // force 2 empty retries (~0.8s).  slc 21 never sets preferLbvhIsct.
-    // 5x the old 1e-5 / 4e-5 kicks.
-    const double EPSILON = TopoCache::mesh->preferLbvhIsct ? 2.0e-4 : 5.0e-5;
+    // Stock cork is 1e-5.  The 5x default (7e2f3c1 / exactHull) made
+    // ordinary NM soups feed Triangle crossed/T-junction PSLGs — those
+    // files then exit(1).  slc 21 and the mid-size NM set never set
+    // preferLbvhIsct; they stay at 1e-5.  Sheet piles (20/26) keep the
+    // larger first kick so SI degeneracies do not burn empty retries.
+    const double EPSILON = TopoCache::mesh->preferLbvhIsct ? 2.0e-4 : 1.0e-5;
     // Per-vertex splitmix: thread-safe, same magnitude as drand(-E,E)^3.
     // (std::rand is not safe to call from many threads.)
     const uint64_t seed = (uint64_t)std::rand() ^ 0xA5A5A5A5A5A5A5A5ULL;

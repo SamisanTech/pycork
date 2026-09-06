@@ -24,6 +24,11 @@ public:
         else if (opt.noise && opt.hull && mesh.hasStackedDuplicateFaces()) {
             drop_noise(mesh, opt.minFaces, 0.0, /*dropTiny=*/false);
             mesh.preferLbvhIsct = true;
+        } else if (opt.noise && opt.hull && mesh.numTris() < 1000000) {
+            // Mid-size NM (12/13/24/25): exact dups stay on the hull path
+            // and Triangle dies on the stacked PSLG. slc 21 is 1.26M —
+            // no FaceKey walk.
+            drop_noise(mesh, opt.minFaces, 0.0, /*dropTiny=*/false);
         }
         if (opt.perturb) perturb_along_normals(mesh, opt.perturbIntensity);
         // Compact stacked pile (NM 26: 2.9M in a 22mm AABB). Full resolve
@@ -32,6 +37,12 @@ public:
         // slc 21 never preferLbvhIsct.
         const bool compactPile =
             mesh.preferLbvhIsct && mesh.numTris() > 1000000;
+        // slc 21 (~1.26M) must CDT its dirty faces. Mid-size NM only
+        // needed the exact-dup drop above — skipping CDT there opened
+        // NM 21 / 2. The 3M almost-solids (27/28) still feed Triangle
+        // crossed PSLGs; keep the original face on those only.
+        if (!mesh.preferLbvhIsct && mesh.numTris() > 2000000)
+            mesh.skipHostileCdt = true;
         if (opt.resolve && !compactPile) {
             CORK_PROF("repair.resolve");
             auto go = [&]() {

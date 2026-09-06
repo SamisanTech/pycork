@@ -270,6 +270,10 @@ public: // OUTER HULL module (single mesh; call after resolveIntersections)
     bool hasStackedDuplicateFaces() const;
     // Sheet-pile soups: LBVH SI instead of packed-grid 336M cell pairs.
     bool preferLbvhIsct = false;
+    // Ordinary NM soups: keep the original face instead of calling
+    // Triangle on a crossed/T-junction axis-drop PSLG (triexit exit(1)).
+    // slc 21 stays off — those dirty faces must CDT or it opens.
+    bool skipHostileCdt = false;
 
 public: // BOOLean operation module
     // all of the form
