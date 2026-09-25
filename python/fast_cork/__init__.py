@@ -1,4 +1,4 @@
-"""pycork — triangle-soup repair and CSG.
+"""fast_cork — triangle-soup repair and CSG.
 
 Callable APIs (optional kwargs shown):
   readSTL(path) -> (verts, tris)
@@ -24,4 +24,4 @@ verts: (N,3) any float dtype — cast to float64 at the CorkMesh boundary
 tris:  (M,3) any integer dtype
 Kernels stay double (exact predicates). File STL is native float32.
 """
-from .pycork import *
+from .fast_cork import *

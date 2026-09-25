@@ -304,27 +304,27 @@ if(BUILD_PYTHON)
 
     set(PYCORK_SRCS
 
-        python/pycork/module.cpp
+        python/fast_cork/module.cpp
     )
 
     SOURCE_GROUP("Python" FILES ${PYCORK_SRCS})
 
-    pybind11_add_module(pycork ${PYCORK_SRCS})
+    pybind11_add_module(fast_cork ${PYCORK_SRCS})
 
     #add_library(example MODULE main.cpp)
 
-    target_link_libraries(pycork PRIVATE pybind11::module cork_static ${PYCORK_LIBS})
+    target_link_libraries(fast_cork PRIVATE pybind11::module cork_static ${PYCORK_LIBS})
     if(TARGET tbb)
-        target_link_libraries(pycork PRIVATE TBB::tbb)
+        target_link_libraries(fast_cork PRIVATE TBB::tbb)
     endif()
-    set_target_properties(pycork PROPERTIES PREFIX "${PYTHON_MODULE_PREFIX}"
+    set_target_properties(fast_cork PROPERTIES PREFIX "${PYTHON_MODULE_PREFIX}"
                                           SUFFIX "${PYTHON_MODULE_EXTENSION}")
 
 
      add_executable(main ${App_SRCS})
      target_link_libraries(main cork_static ${PYCORK_LIBS})
 
-    install(TARGETS pycork DESTINATION lib/pycork)
+    install(TARGETS fast_cork DESTINATION lib/fast_cork)
 
     #install(TARGETS mpir_static DESTINATION )
 else(BUILD_PYTHON)

@@ -76,16 +76,16 @@ class CMakeBuild(build_ext):
 
 
 setup(
-    name='pycork',
+    name='fast_cork',
     version='0.1.3',
     author='Luke Parry',
     author_email='dev@lukeparry.uk',
     long_description=readme,
     long_description_content_type = 'text/x-rst',
     description='pycork provides a fully compiled interface to the cork boolean library ',
-    ext_modules=[CMakeExtension('pycork.pycork', 'pycork')],
+    ext_modules=[CMakeExtension('fast_cork.fast_cork', 'fast_cork')],
     cmdclass=dict(build_ext=CMakeBuild),
-    packages = ['pycork'],
+    packages = ['fast_cork'],
     package_dir={'': 'python'},
     keywords=['Boolean CSG', 'Cork'],
     # tell setuptools that all packages will be under the 'src' directory

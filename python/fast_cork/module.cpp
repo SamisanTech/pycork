@@ -388,12 +388,12 @@ std::tuple<EigenVecX3d, EigenVecX3i, py::dict> repair(const EigenVecX3d &verts,
 
 
 
-PYBIND11_MODULE(pycork, m) {
+PYBIND11_MODULE(fast_cork, m) {
 
     m.doc() = R"pbdoc(
         Pycork Module
         -----------------------
-        .. currentmodule:: pycork
+        .. currentmodule:: fast_cork
         .. autosummary::
            :toctree: _generate
 
