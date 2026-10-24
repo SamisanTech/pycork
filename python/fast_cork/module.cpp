@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <string>
 
 #include <Eigen/Eigen>
@@ -302,6 +303,8 @@ std::tuple<EigenVecX3d, EigenVecX3i, py::dict> repair(const EigenVecX3d &verts,
                                                      const std::string &hull_backend,
                                                      bool exactHull) {
     CORK_PROF("py.repair total");
+    std::fprintf(stderr, "fast_cork: repair enter\n");
+    std::fflush(stderr);
     CorkMesh mesh;
     {
         CORK_PROF("py.eigenToCorkMesh");
@@ -371,6 +374,9 @@ std::tuple<EigenVecX3d, EigenVecX3i, py::dict> repair(const EigenVecX3d &verts,
     d["noise"] = noise;
     d["collapse"] = collapse;
     d["si_subset"] = si_subset;
+    d["si_aborted"] = mesh.siUnbounded;
+    d["si_cross_pairs"] = mesh.siAbortPairs;
+    d["si_hits"] = mesh.siAbortHits;
     d["raysPerPatch"] = raysPerPatch;
     d["minFaces"] = minFaces;
     d["shells"] = st.shells;

@@ -31,7 +31,11 @@
 #include <stdexcept>
 #include <cstdint>
 #include <cmath>
+#include <limits>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cork/accel/bbox_avx.h>
 #include <cork/util/parallel.h>
 #include <cork/util/profile.h>
@@ -1046,6 +1050,11 @@ protected: // DATA
     IterPool<OrigEdgeType>      oepool;
     IterPool<SplitEdgeType>     sepool;
     IterPool<GenericTriType>    gtpool;
+    // Too many edge-tri pairs or hits to build a subdivision. Not a
+    // degeneracy: do not perturb-and-retry, and do not commit.
+    bool unbounded = false;
+    long long abort_pairs = 0;
+    long long abort_hits = 0;
 private:
     std::vector<Vec3d>          quantized_coords;
 private:
@@ -1217,6 +1226,36 @@ struct CellGrid {
 
 inline uint32_t entryKey(uint64_t e) { return (uint32_t)(e >> 32); }
 inline uint32_t entryIdx(uint64_t e) { return (uint32_t)(e & 0xffffffffu); }
+
+// Walk the two sorted cell streams once. Stops early once the running
+// total crosses `limit` so a piled mesh does not scan billions of pairs.
+inline long long estimateCellCrossPairs(const RawArray<uint64_t> &tent,
+                                        const RawArray<uint64_t> &eent,
+                                        long long limit,
+                                        long long &hottest)
+{
+    hottest = 0;
+    long long total = 0;
+    size_t i = 0, ep = 0;
+    const size_t NT = tent.size(), NE = eent.size();
+    while (i < NT && ep < NE) {
+        uint32_t kt = entryKey(tent[i]);
+        uint32_t ke = entryKey(eent[ep]);
+        if (ke < kt) { ++ep; continue; }
+        if (kt < ke) { ++i; continue; }
+        size_t j = i + 1;
+        while (j < NT && entryKey(tent[j]) == kt) ++j;
+        size_t eq = ep + 1;
+        while (eq < NE && entryKey(eent[eq]) == ke) ++eq;
+        long long pairs = (long long)(j - i) * (long long)(eq - ep);
+        if (pairs > hottest) hottest = pairs;
+        total += pairs;
+        if (total > limit) return total;
+        i = j;
+        ep = eq;
+    }
+    return total;
+}
 
 // sorted (cell<<32 | prim) entries for a set of boxes
 template<class BoxArray>
@@ -1423,7 +1462,17 @@ bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
             cork_par::Local<std::vector<EdgeTriHit>> tls_hits;
             cork_par::Local<int> tls_degen([] { return 0; });
             cork_par::Local<std::array<long long, 3>> tls_cnt([] { return std::array<long long, 3>{0, 0, 0}; });
+            std::atomic<int> timed_out{0};
+            std::atomic<long long> narrow_n{0};
+            const auto query_t0 = std::chrono::steady_clock::now();
+            const double kQueryBudgetSec = 2.0;
             auto handle_pair = [&](uint32_t ei, uint32_t ti, std::vector<EdgeTriHit> &local_hits, std::array<long long, 3> &cnt) {
+                if (timed_out.load(std::memory_order_relaxed)) return;
+                if ((narrow_n.fetch_add(1, std::memory_order_relaxed) & 4095) == 0) {
+                    double sec = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - query_t0).count();
+                    if (sec > kQueryBudgetSec) timed_out.store(1, std::memory_order_relaxed);
+                }
                 const EdgeRec &er = erec[ei];
                 const TriRec &tr = trec[ti];
                 if (er.v[0] == tr.v[0] || er.v[0] == tr.v[1] || er.v[0] == tr.v[2] ||
@@ -1446,20 +1495,33 @@ bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
                 auto &cnt = tls_cnt.local();
                 empty3d::degeneracy_count = 0;
                 cork_lbvh::BoxF q = cork_lbvh::toBoxF(tbb_[ti]);
-                tree.query(q, [&](uint32_t ei) { handle_pair(ei, (uint32_t)ti, local_hits, cnt); });
+                tree.query(q, [&](uint32_t ei) {
+                    if (timed_out.load(std::memory_order_relaxed)) return;
+                    handle_pair(ei, (uint32_t)ti, local_hits, cnt);
+                }, &timed_out);
                 tls_degen.local() += empty3d::degeneracy_count;
                 empty3d::degeneracy_count = 0;
             });
             } else {
             cork_par::for_each_idx(ne, 64, [&](size_t ei) {
+                if (timed_out.load(std::memory_order_relaxed)) return;
                 auto &local_hits = tls_hits.local();
                 auto &cnt = tls_cnt.local();
                 empty3d::degeneracy_count = 0;
                 cork_lbvh::BoxF q = cork_lbvh::toBoxF(ebb[ei]);
-                tree.query(q, [&](uint32_t ti) { handle_pair((uint32_t)ei, ti, local_hits, cnt); });
+                tree.query(q, [&](uint32_t ti) {
+                    if (timed_out.load(std::memory_order_relaxed)) return;
+                    handle_pair((uint32_t)ei, ti, local_hits, cnt);
+                }, &timed_out);
                 tls_degen.local() += empty3d::degeneracy_count;
                 empty3d::degeneracy_count = 0;
             });
+            }
+            if (timed_out.load(std::memory_order_relaxed)) {
+                unbounded = true;
+                std::fprintf(stderr, "fast_cork: SI abort, LBVH query exceeded %.1fs\n", kQueryBudgetSec);
+                std::fflush(stderr);
+                return false;
             }
             tls_hits.combine_each([&](std::vector<EdgeTriHit> &v) { hits.insert(hits.end(), v.begin(), v.end()); });
             tls_degen.combine_each([&](int d) { any_degen += d; });
@@ -1505,6 +1567,39 @@ bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
         cork_prof::note("      #edge entries", (double)eent.size());
         cork_prof::note("      #tri entries", (double)tent.size());
     }
+    // Early abort on packing density + pair count.
+    // Pair estimates alone can invert solvability on huge spread meshes, while
+    // faces/cell alone can false-positive on small/medium compact parts:
+    //   26_1.stl      ~186k faces / ~5.8e5 cells ≈ 0.32  (solvable)
+    //   32_1.stl      ~32k  faces / ~3.2e3 cells ≈ 10.0, pairs ≈ 1.0e7 (solves in ~0.12s)
+    //   1_problem.stl ~186k faces / ~2.0e3 cells ≈ 95.0, pairs ≈ 2.9e9 (join never finishes)
+    // Abort when faces/cell > 25, or when faces/cell > 8 AND pairs_est > 1e8.
+    {
+        long long hottest = 0;
+        long long pairs = estimateCellCrossPairs(
+            tent, eent, std::numeric_limits<long long>::max() / 4, hottest);
+        cork_prof::note("      #cell cross pairs (est)", (double)pairs);
+        cork_prof::note("      hottest cell pairs (est)", (double)hottest);
+        const long long ncells =
+            std::max(1LL, (long long)grid.nx * (long long)grid.ny * (long long)grid.nz);
+        const double pack = (double)nt / (double)ncells;
+        cork_prof::note("      faces per cell", pack);
+        const double kPackHardLimit = 25.0;
+        const double kPackSoftLimit = 8.0;
+        const long long kPairsSoftLimit = 100000000LL;
+        if (pack > kPackHardLimit || (pack > kPackSoftLimit && pairs > kPairsSoftLimit)) {
+            unbounded = true;
+            // milli-faces/cell + cell count for Python stats / logs
+            abort_pairs = (long long)std::llround(pack * 1000.0);
+            abort_hits = ncells;
+            std::fprintf(stderr,
+                "fast_cork: SI abort, faces/cell=%.3f (limits %.1f/%.1f), "
+                "ncells=%lld, faces=%zu, pairs_est=%lld, hottest=%lld\n",
+                pack, kPackSoftLimit, kPackHardLimit, ncells, nt, pairs, hottest);
+            std::fflush(stderr);
+            return false;
+        }
+    }
     // edge boxes in sorted-entry order: the inner join loop then streams
     // through contiguous memory instead of gathering random 48 byte boxes
     // edge boxes in sorted-entry order as SoA floats (rounded outward), so the
@@ -1536,7 +1631,14 @@ bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
         const bool verify_coords = std::getenv("CORK_VERIFY_COORDS") != nullptr;
 
         cork_par::Local<std::vector<size_t>> tls_cand;
+        std::atomic<int> timed_out{0};
+        const auto join_t0 = std::chrono::steady_clock::now();
+        // Pack abort already stops 1_problem (~95 faces/cell). Spread meshes
+        // like 26_1 (~0.3 faces/cell) can need tens of seconds of join work
+        // and still finish; keep a soft ceiling only.
+        const double kJoinBudgetSec = 60.0;
         cork_par::for_range(nchunks, 1, [&](size_t cb, size_t ce) {
+            if (timed_out.load(std::memory_order_relaxed)) return;
             auto &local_hits = tls_hits.local();
             auto &cnt = tls_cnt.local();
             auto &cand = tls_cand.local();
@@ -1544,6 +1646,7 @@ bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
             empty3d::degeneracy_count = 0;
             empty3d::exact_count = 0;
             for (size_t c = cb; c < ce; ++c) {
+                if (timed_out.load(std::memory_order_relaxed)) return;
                 size_t i = starts[c], end = starts[c + 1];
                 if (i >= end) continue;
                 uint32_t k0 = entryKey(tent[i]);
@@ -1557,6 +1660,15 @@ bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
                         size_t eq = ep + 1;
                         while (eq < NE && entryKey(eent[eq]) == k) ++eq;
                         for (size_t a = i; a < j; ++a) {
+                            if ((a & 255) == 0) {
+                                double sec = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - join_t0).count();
+                                if (sec > kJoinBudgetSec) {
+                                    timed_out.store(1, std::memory_order_relaxed);
+                                    return;
+                                }
+                            }
+                            if (timed_out.load(std::memory_order_relaxed)) return;
                             uint32_t ti = entryIdx(tent[a]);
                             const BBox3d &tb = tbb_[ti];
                             const BoxF tbf = toBoxF(tb);
@@ -1610,6 +1722,12 @@ bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
             empty3d::exact_count = 0;
         });
 
+        if (timed_out.load(std::memory_order_relaxed)) {
+            unbounded = true;
+            std::fprintf(stderr, "fast_cork: SI abort, edge-tri join exceeded %.1fs\n", kJoinBudgetSec);
+            std::fflush(stderr);
+            return false;
+        }
         tls_hits.combine_each([&](std::vector<EdgeTriHit> &v) { hits.insert(hits.end(), v.begin(), v.end()); });
         tls_degen.combine_each([&](int d) { any_degen += d; });
         long long tot[9] = {0,0,0,0,0,0,0,0,0};
@@ -1622,6 +1740,20 @@ bool Mesh<VertData,TriData>::IsctProblem::tryToFindIntersections()
         cork_prof::note("      SI busy CPU ms (sum threads)", (double)tot[4] * 1e-6);
         if (verify_coords) cork_prof::note("      #coords != GMP reference", (double)tot[3]);
         cork_prof::note("      #edge-tri hits", (double)hits.size());
+        // Hits, not face count: each hit becomes a glue point, then
+        // tri-tri-tri is quadratic in intersections per face.
+        // 26_1.stl resolves with ~2.6e6 hits; 1_problem.stl measured ~21e6
+        // (and is already stopped by faces/cell). Mid-way soft cap ~4e6.
+        const long long kHitLimit = 4000000LL;
+        if ((long long)hits.size() > kHitLimit) {
+            unbounded = true;
+            abort_hits = (long long)hits.size();
+            std::fprintf(stderr,
+                "fast_cork: SI abort, edge-tri hits=%lld (limit %lld)\n",
+                abort_hits, kHitLimit);
+            std::fflush(stderr);
+            return false;
+        }
 
         // deterministic order for a given perturbation
         cork_par::sort(hits.begin(), hits.end(), [](const EdgeTriHit &a, const EdgeTriHit &b) {
@@ -1779,6 +1911,12 @@ void Mesh<VertData,TriData>::IsctProblem::findIntersections()
         {
             CORK_PROF("    tryToFindIntersections");
             ok = tryToFindIntersections();
+        }
+        if (unbounded) {
+            TopoCache::mesh->siUnbounded = true;
+            TopoCache::mesh->siAbortPairs = abort_pairs;
+            TopoCache::mesh->siAbortHits = abort_hits;
+            return;
         }
         if(!ok) {
             CORK_PROF("    reset+perturb (retry)");
@@ -2227,7 +2365,9 @@ void Mesh<VertData,TriData>::IsctProblem::resolveAllIntersections()
                     t->edges[k] = nullptr;
                     tri.v[k] = v->ref;
                 }
-                // resolveIntersection does not consume bool_alg_data
+                // Boolean ops label faces before resolve. New pieces must
+                // inherit bool_alg_data or diff/intersect keep the wrong set.
+                fillOutTriData(t, tprob->the_tri);
                 ++w;
             }
             TopoCache::freeTri(tprob->the_tri);
@@ -2317,6 +2457,10 @@ void Mesh<VertData,TriData>::resolveIntersections()
     {
         CORK_PROF("  findIntersections");
         iproblem.findIntersections();
+    }
+    if (siUnbounded) {
+        delete ip;
+        return;
     }
     {
         CORK_PROF("  resolveAllIntersections");

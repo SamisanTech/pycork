@@ -1,4 +1,4 @@
-﻿// +-------------------------------------------------------------------------
+// +-------------------------------------------------------------------------
 // | empty3d.cpp
 // | 
 // | Author: Gilbert Bernstein
@@ -37,9 +37,9 @@
 namespace empty3d {
 
 // externalized counters...
-thread_local int degeneracy_count = 0;
-thread_local int exact_count = 0;
-thread_local int callcount = 0;
+CORK_TLS int degeneracy_count = 0;
+CORK_TLS int exact_count = 0;
+CORK_TLS int callcount = 0;
 
 using namespace ext4;
 using namespace AbsExt4;

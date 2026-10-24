@@ -64,9 +64,18 @@ bool emptyExact(const TriTriTriIn &input);
 Vec3d coordsExact(const TriTriTriIn &input);
 Vec3d coordsExactGmp(const TriTriTriIn &input);
 
-extern thread_local int degeneracy_count; // count degeneracies encountered
-extern thread_local int exact_count; // count of filter calls failed
-extern thread_local int callcount; // total call count
+// thread_local in a memimporter-loaded pyd corrupts the heap when the repair
+// QThread exits (TLS callbacks are never registered). Serial cork keeps
+// process globals; TBB builds stay per-thread.
+#if defined(CORK_USE_TBB)
+#define CORK_TLS thread_local
+#else
+#define CORK_TLS
+#endif
+
+extern CORK_TLS int degeneracy_count; // count degeneracies encountered
+extern CORK_TLS int exact_count; // count of filter calls failed
+extern CORK_TLS int callcount; // total call count
 
 /*
 // exact versions

@@ -646,22 +646,28 @@ struct memorypool {
 
 /* Global constants.                                                         */
 
-/* thread_local: triangulate() is otherwise fully reentrant (all state lives */
-/*   in struct mesh / struct behavior).  Making these per-thread lets cork   */
-/*   triangulate many independent problems concurrently.  Results are       */
-/*   unchanged: triangleinit() resets randomseed and recomputes the          */
-/*   constants on every call anyway.                                         */
+/* Per-thread only when TBB is on. A memimporter-loaded pyd does not register
+   TLS callbacks, so thread_local corrupts the heap when the repair thread
+   exits. triangleinit() resets randomseed and recomputes these every call. */
 
-thread_local REAL splitter; /* Used to split REAL factors for exact multiplication. */
-thread_local REAL epsilon;                /* Floating-point machine epsilon. */
-thread_local REAL resulterrbound;
-thread_local REAL ccwerrboundA, ccwerrboundB, ccwerrboundC;
-thread_local REAL iccerrboundA, iccerrboundB, iccerrboundC;
-thread_local REAL o3derrboundA, o3derrboundB, o3derrboundC;
+#ifndef CORK_TLS
+#if defined(CORK_USE_TBB)
+#define CORK_TLS thread_local
+#else
+#define CORK_TLS
+#endif
+#endif
+
+CORK_TLS REAL splitter; /* Used to split REAL factors for exact multiplication. */
+CORK_TLS REAL epsilon;                /* Floating-point machine epsilon. */
+CORK_TLS REAL resulterrbound;
+CORK_TLS REAL ccwerrboundA, ccwerrboundB, ccwerrboundC;
+CORK_TLS REAL iccerrboundA, iccerrboundB, iccerrboundC;
+CORK_TLS REAL o3derrboundA, o3derrboundB, o3derrboundC;
 
 /* Random number seed is not constant, but I've made it global anyway.       */
 
-thread_local unsigned long randomseed;        /* Current random number seed. */
+CORK_TLS unsigned long randomseed;        /* Current random number seed. */
 
 
 /* Mesh data structure.  Triangle operates on only one mesh, but the mesh    */

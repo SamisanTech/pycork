@@ -52,9 +52,11 @@ public:
             try {
                 go();
             } catch (const std::exception &) {
+                if (mesh.siUnbounded) return;
                 drop_noise(mesh, opt.minFaces);
                 go();
             }
+            if (mesh.siUnbounded) return;
         }
         if (opt.collapse) collapse_short_edges(mesh, opt.collapseRel);
         bool needFill = true;

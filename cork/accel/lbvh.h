@@ -252,8 +252,9 @@ struct LBVH {
 
     // Call fn(leafPrim[leaf]) for every leaf whose box overlaps q.
     template<class Fn>
-    void query(const BoxF &q, Fn &&fn) const {
+    void query(const BoxF &q, Fn &&fn, const std::atomic<int> *stop = nullptr) const {
         if (n <= 0) return;
+        if (stop && stop->load(std::memory_order_relaxed)) return;
         if (n == 1) {
             if (overlapF(q, nodeBox[0])) fn(leafPrim[0]);
             return;
@@ -262,6 +263,7 @@ struct LBVH {
         int top = -1;
         int node = 1;
         while (1) {
+            if (stop && stop->load(std::memory_order_relaxed)) return;
             int in = node2internal(node);
             int c1 = child1[in], c2 = child2[in];
             bool t1 = overlapF(q, nodeBox[c1]);
