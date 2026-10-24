@@ -5,6 +5,7 @@
 #include <cork/rawmesh/rawMesh.h>
 #include <cork/mesh/mesh.h>
 #include <cork/cork.h>
+#include <cork/cancel.h>
 
 #include <pybind11/pybind11.h>
 
@@ -26,23 +27,33 @@ typedef Eigen::Matrix<double,Eigen::Dynamic,3> EigenVecX3d;
 typedef Eigen::Matrix<uint64_t,Eigen::Dynamic,3> EigenVecX3i;
 typedef std::tuple<EigenVecX3d, EigenVecX3i> MeshTuple;
 
+[[noreturn]] void throw_cancelled()
+{
+    throw std::runtime_error("cancelled");
+}
+
 bool isSolid(const EigenVecX3d &verts,
              const EigenVecX3i &tris) {
 
-    CorkMesh mesh;
+    cork_reset_cancel();
+    try {
+        py::gil_scoped_release release;
+        CorkMesh mesh;
 
-    eigenToCorkMesh(verts, tris, &mesh);
+        eigenToCorkMesh(verts, tris, &mesh);
 
-    bool result = true;
+        bool result = true;
 
-    if(mesh.isSelfIntersecting())
-        result = false;
+        if(mesh.isSelfIntersecting())
+            result = false;
 
-    if(!mesh.isClosed())
-        result = false;
+        if(!mesh.isClosed())
+            result = false;
 
-    return result;
-
+        return result;
+    } catch (const CorkCancelled &) {
+        throw_cancelled();
+    }
 }
 
 
@@ -51,18 +62,24 @@ MeshTuple booleanUnion(const EigenVecX3d &vertsA,
                        const EigenVecX3d &vertsB,
                        const EigenVecX3i &trisB) {
 
-    CorkMesh meshA, meshB;
+    cork_reset_cancel();
+    try {
+        py::gil_scoped_release release;
+        CorkMesh meshA, meshB;
 
-    eigenToCorkMesh(vertsA, trisA, &meshA);
-    eigenToCorkMesh(vertsB, trisB, &meshB);
+        eigenToCorkMesh(vertsA, trisA, &meshA);
+        eigenToCorkMesh(vertsB, trisB, &meshB);
 
-    MeshTuple meshOut;
+        MeshTuple meshOut;
 
-    meshA.boolUnion(meshB);
+        meshA.boolUnion(meshB);
 
-    corkMesh2Eigen(meshA, std::get<0>(meshOut), std::get<1>(meshOut));
+        corkMesh2Eigen(meshA, std::get<0>(meshOut), std::get<1>(meshOut));
 
-    return meshOut;
+        return meshOut;
+    } catch (const CorkCancelled &) {
+        throw_cancelled();
+    }
 }
 
 MeshTuple booleanDifference(const EigenVecX3d &vertsA,
@@ -70,18 +87,24 @@ MeshTuple booleanDifference(const EigenVecX3d &vertsA,
                             const EigenVecX3d &vertsB,
                             const EigenVecX3i &trisB) {
 
-    CorkMesh meshA, meshB;
+    cork_reset_cancel();
+    try {
+        py::gil_scoped_release release;
+        CorkMesh meshA, meshB;
 
-    eigenToCorkMesh(vertsA, trisA, &meshA);
-    eigenToCorkMesh(vertsB, trisB, &meshB);
+        eigenToCorkMesh(vertsA, trisA, &meshA);
+        eigenToCorkMesh(vertsB, trisB, &meshB);
 
-    MeshTuple meshOut;
+        MeshTuple meshOut;
 
-    meshA.boolDiff(meshB);
+        meshA.boolDiff(meshB);
 
-    corkMesh2Eigen(meshA, std::get<0>(meshOut), std::get<1>(meshOut));
+        corkMesh2Eigen(meshA, std::get<0>(meshOut), std::get<1>(meshOut));
 
-    return meshOut;
+        return meshOut;
+    } catch (const CorkCancelled &) {
+        throw_cancelled();
+    }
 }
 
 MeshTuple booleanIntersection(const EigenVecX3d &vertsA,
@@ -89,18 +112,24 @@ MeshTuple booleanIntersection(const EigenVecX3d &vertsA,
                               const EigenVecX3d &vertsB,
                               const EigenVecX3i &trisB) {
 
-    CorkMesh meshA, meshB;
+    cork_reset_cancel();
+    try {
+        py::gil_scoped_release release;
+        CorkMesh meshA, meshB;
 
-    eigenToCorkMesh(vertsA, trisA, &meshA);
-    eigenToCorkMesh(vertsB, trisB, &meshB);
+        eigenToCorkMesh(vertsA, trisA, &meshA);
+        eigenToCorkMesh(vertsB, trisB, &meshB);
 
-    MeshTuple meshOut;
+        MeshTuple meshOut;
 
-    meshA.boolIsct(meshB);
+        meshA.boolIsct(meshB);
 
-    corkMesh2Eigen(meshA, std::get<0>(meshOut), std::get<1>(meshOut));
+        corkMesh2Eigen(meshA, std::get<0>(meshOut), std::get<1>(meshOut));
 
-    return meshOut;
+        return meshOut;
+    } catch (const CorkCancelled &) {
+        throw_cancelled();
+    }
 }
 
 
@@ -109,35 +138,47 @@ MeshTuple booleanXor(const EigenVecX3d &vertsA,
                      const EigenVecX3d &vertsB,
                      const EigenVecX3i &trisB) {
 
-    CorkMesh meshA, meshB;
+    cork_reset_cancel();
+    try {
+        py::gil_scoped_release release;
+        CorkMesh meshA, meshB;
 
-    eigenToCorkMesh(vertsA, trisA, &meshA);
-    eigenToCorkMesh(vertsB, trisB, &meshB);
+        eigenToCorkMesh(vertsA, trisA, &meshA);
+        eigenToCorkMesh(vertsB, trisB, &meshB);
 
-    MeshTuple meshOut;
+        MeshTuple meshOut;
 
-    meshA.boolXor(meshB);
+        meshA.boolXor(meshB);
 
-    corkMesh2Eigen(meshA, std::get<0>(meshOut), std::get<1>(meshOut));
+        corkMesh2Eigen(meshA, std::get<0>(meshOut), std::get<1>(meshOut));
 
-    return meshOut;
+        return meshOut;
+    } catch (const CorkCancelled &) {
+        throw_cancelled();
+    }
 }
 
 
 MeshTuple resolveIntersection(const EigenVecX3d &vertsA,
                               const EigenVecX3i &trisA) {
 
-    CorkMesh meshA;
+    cork_reset_cancel();
+    try {
+        py::gil_scoped_release release;
+        CorkMesh meshA;
 
-    eigenToCorkMesh(vertsA, trisA, &meshA);
+        eigenToCorkMesh(vertsA, trisA, &meshA);
 
-    MeshTuple meshOut;
+        MeshTuple meshOut;
 
-    meshA.resolveIntersections();
+        meshA.resolveIntersections();
 
-    corkMesh2Eigen(meshA, std::get<0>(meshOut), std::get<1>(meshOut));
+        corkMesh2Eigen(meshA, std::get<0>(meshOut), std::get<1>(meshOut));
 
-    return meshOut;
+        return meshOut;
+    } catch (const CorkCancelled &) {
+        throw_cancelled();
+    }
 }
 
 
@@ -157,7 +198,13 @@ PYBIND11_MODULE(pycork, m) {
 
     )pbdoc";
 
-    m.def("isSolid", &pycork::isSolid, "Determines if the mesh is manifold",
+    m.def("request_cancel", &cork_request_cancel,
+          "Request cooperative cancel of an in-flight Cork operation")
+     .def("reset_cancel", &cork_reset_cancel,
+          "Clear the cooperative cancel flag before starting a new Cork op")
+     .def("is_cancelled", &cork_is_cancelled,
+          "True if cancel was requested for the current Cork op")
+     .def("isSolid", &pycork::isSolid, "Determines if the mesh is manifold",
                      py::arg("vertices"), py::arg("tris"))
      .def("union", &pycork::booleanUnion, "Computes boolean Union between two meshes",
                     py::arg("vertsA"), py::arg("trisA"),
@@ -168,9 +215,9 @@ PYBIND11_MODULE(pycork, m) {
      .def("intersection", &pycork::booleanIntersection, "Computes boolean intersection between two meshes",
                    py::arg("vertsA"), py::arg("trisA"),
                    py::arg("vertsB"), py::arg("trisB"))
-     .def("intersection", &pycork::booleanIntersection, "Computes boolean xor between two meshes",
-                           py::arg("vertsA"), py::arg("trisA"),
-                           py::arg("vertsB"), py::arg("trisB"))
+     .def("xor", &pycork::booleanXor, "Computes boolean xor between two meshes",
+                   py::arg("vertsA"), py::arg("trisA"),
+                   py::arg("vertsB"), py::arg("trisB"))
      .def("resolveIntersection", &pycork::resolveIntersection, "Computes the intersection between two meshes",
                                   py::arg("vertsA"), py::arg("trisA"));
 
@@ -182,4 +229,3 @@ PYBIND11_MODULE(pycork, m) {
 #endif
 
 }
-

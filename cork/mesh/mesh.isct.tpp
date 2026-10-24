@@ -26,6 +26,7 @@
 #pragma once
 
 #include <chrono>
+#include <cork/cancel.h>
 
 struct GenericVertType;
 struct IsctVertType;
@@ -975,12 +976,15 @@ inline void Mesh<VertData, TriData>::IsctProblem::bvh_edge_tri(
 
     // use the acceleration structure
     bool aborted = false;
+    // Strided cancel: avoid an atomic load on every BVH hit (was ~2% on large SI).
+    unsigned cancel_counter = 0;
     TopoCache::tris.for_each([&](Tptr t)
                              {
         // compute BBox
         BBox3d bbox = buildBox(t);
         if(!aborted) {
             edgeBVH.for_each_in_box(bbox, [&](Eptr e) {
+                cork_throw_if_cancelled_strided(cancel_counter);
                 if(!func(e,t))
                     aborted = true;
             });
@@ -1113,6 +1117,7 @@ bool Mesh<VertData, TriData>::IsctProblem::findIntersections(double epsi)
     perturbPositions(epsi); // always perturb for safety...
     while (nTrys > 0)
     {
+        cork_throw_if_cancelled();
         if (!tryToFindIntersections())
         {
             reset();
@@ -1491,14 +1496,20 @@ void Mesh<VertData, TriData>::IsctProblem::resolveAllIntersections()
 
         // solve a subdivision problem in each triangle
         tprobs.for_each([&](Tprob tprob)
-                        { tprob->subdivide(this); });
+                        {
+                            cork_throw_if_cancelled();
+                            tprob->subdivide(this);
+                        });
 
         // now we have diced up triangles inside each triangle problem
 
         // Let's go through the glue points and create a new concrete
         // vertex object for each of these.
         glue_pts.for_each([&](GluePt glue)
-                          { createRealPtFromGluePt(glue); });
+                          {
+                              cork_throw_if_cancelled();
+                              createRealPtFromGluePt(glue);
+                          });
 
         EdgeCache ecache(this);
 
@@ -1507,7 +1518,10 @@ void Mesh<VertData, TriData>::IsctProblem::resolveAllIntersections()
         // for each of those.
         // Along the way, let's go ahead and hook up edges as appropriate
         tprobs.for_each([&](Tprob tprob)
-                        { createRealTriangles(tprob, ecache); });
+                        {
+                            cork_throw_if_cancelled();
+                            createRealTriangles(tprob, ecache);
+                        });
 
         // mark all edges as normal by zero-ing out the data pointer
         TopoCache::edges.for_each([](Eptr e)
@@ -1527,6 +1541,10 @@ void Mesh<VertData, TriData>::IsctProblem::resolveAllIntersections()
         Eptr e = ecache.maybeEdge(se);
             ENSURE(e);
         e->data = (void*)1; });
+    }
+    catch (const CorkCancelled &)
+    {
+        throw;
     }
     catch (const std::runtime_error &e)
     {
@@ -1606,6 +1624,10 @@ bool Mesh<VertData, TriData>::resolveIntersections(double epsi)
     try
     {
         iproblem.resolveAllIntersections();
+    }
+    catch (const CorkCancelled &)
+    {
+        throw;
     }
     catch (const std::exception &e)
     {

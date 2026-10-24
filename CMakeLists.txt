@@ -119,6 +119,7 @@ link_directories(
 
 set(APP_H_SRCS
     cork/cork.h
+    cork/cancel.h
     cork/accel/aabvh.h
     cork/file_formats/files.h
     cork/isct/absext4.h
@@ -148,6 +149,7 @@ set(APP_H_SRCS
 
 set(APP_CPP_SRCS
     cork/cork.cpp
+    cork/cancel.cpp
     cork/file_formats/files.cpp
     cork/file_formats/ifs.cpp
     cork/file_formats/off.cpp
