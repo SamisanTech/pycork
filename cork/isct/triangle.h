@@ -287,6 +287,11 @@ struct CORK_EXPORT triangulateio {
 /*#ifdef ANSI_DECLARATORS*/
 void CORK_EXPORT triangulate(char *, struct triangulateio *, struct triangulateio *,
                  struct triangulateio *);
+
+/* Set when triangulate() bailed out via triexit. Not thread_local: this pyd
+   is loaded by memimporter, which does not register TLS callbacks. Triangulation
+   is serial while CORK_TBB is off. */
+extern volatile int g_cork_tri_aborted;
 void CORK_EXPORT trifree(void *memptr);
 /*#else*/ /* not ANSI_DECLARATORS */
 /*void triangulate();

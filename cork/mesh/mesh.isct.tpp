@@ -706,6 +706,22 @@ public:
 
         char *params = (char*)("pzQYY");
         triangulate(params, &in, &out, nullptr);
+        if (g_cork_tri_aborted) {
+            g_cork_tri_aborted = 0;
+            std::fprintf(stderr, "fast_cork: kept original face after triangle abort\n");
+            std::fflush(stderr);
+            free(in.pointlist);
+            free(in.pointmarkerlist);
+            free(in.segmentlist);
+            free(in.segmentmarkerlist);
+            free(out.pointlist);
+            free(out.pointmarkerlist);
+            free(out.trianglelist);
+            free(out.segmentlist);
+            free(out.segmentmarkerlist);
+            keep_original_face(d);
+            return;
+        }
 
         ENSURE(out.numberofpoints == in.numberofpoints);
         d.tris.assign(out.trianglelist, out.trianglelist + 3*out.numberoftriangles);

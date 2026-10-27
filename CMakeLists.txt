@@ -305,6 +305,7 @@ if(BUILD_PYTHON)
     set(PYCORK_SRCS
 
         python/fast_cork/module.cpp
+        python/fast_cork/seh_guard.cpp
     )
 
     SOURCE_GROUP("Python" FILES ${PYCORK_SRCS})

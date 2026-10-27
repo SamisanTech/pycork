@@ -349,6 +349,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <setjmp.h>
 #ifndef NO_TIMER
 #include <sys/time.h>
 #endif /* not NO_TIMER */
@@ -1424,6 +1425,10 @@ REAL area;                                      /* The area of the triangle. */
 /**                                                                         **/
 /**                                                                         **/
 
+jmp_buf g_cork_tri_jmp;
+volatile int g_cork_tri_armed = 0;
+volatile int g_cork_tri_aborted = 0;
+
 #ifdef ANSI_DECLARATORS
 void triexit(int status)
 #else /* not ANSI_DECLARATORS */
@@ -1432,7 +1437,17 @@ int status;
 #endif /* not ANSI_DECLARATORS */
 
 {
-  exit(status);
+  /* Mira: exit() kills the process. A C++ throw here also kills it: unwinding
+     through Triangle and the repair SEH frame becomes 0xE06D7363 under
+     memimporter. longjmp back to triangulate() instead. */
+  fprintf(stderr, "fast_cork: triangle exit(%d) caught\n", status);
+  fflush(stderr);
+  if (g_cork_tri_armed) {
+    g_cork_tri_armed = 0;
+    longjmp(g_cork_tri_jmp, status ? status : 1);
+  }
+  fprintf(stderr, "fast_cork: triangle exit had no handler\n");
+  fflush(stderr);
 }
 
 #ifdef ANSI_DECLARATORS
@@ -15722,6 +15737,44 @@ char **argv;
 #endif /* not TRILIBRARY */
 
 {
+#ifdef TRILIBRARY
+  /* Jump target for triexit(). Must sit above `struct mesh m` so a longjmp
+     returns before that object exists and does not run its destructor. */
+  if (setjmp(g_cork_tri_jmp) != 0) {
+    g_cork_tri_armed = 0;
+    g_cork_tri_aborted = 1;
+    fprintf(stderr, "fast_cork: triangle abort returned\n");
+    fflush(stderr);
+    if (out) {
+      out->pointlist = NULL;
+      out->pointattributelist = NULL;
+      out->pointmarkerlist = NULL;
+      out->numberofpoints = 0;
+      out->numberofpointattributes = 0;
+      out->trianglelist = NULL;
+      out->triangleattributelist = NULL;
+      out->triangleadoubleist = NULL;
+      out->neighborlist = NULL;
+      out->numberoftriangles = 0;
+      out->numberofcorners = 0;
+      out->numberoftriangleattributes = 0;
+      out->segmentlist = NULL;
+      out->segmentmarkerlist = NULL;
+      out->numberofsegments = 0;
+      out->holelist = NULL;
+      out->numberofholes = 0;
+      out->regionlist = NULL;
+      out->numberofregions = 0;
+      out->edgelist = NULL;
+      out->edgemarkerlist = NULL;
+      out->normlist = NULL;
+      out->numberofedges = 0;
+    }
+    return;
+  }
+  g_cork_tri_armed = 1;
+  g_cork_tri_aborted = 0;
+#endif /* TRILIBRARY */
   struct mesh m;
   struct behavior b;
   REAL *holearray;                                        /* Array of holes. */
@@ -16033,7 +16086,9 @@ char **argv;
 #endif /* not REDUCED */
 
   triangledeinit(&m, &b);
-#ifndef TRILIBRARY
+#ifdef TRILIBRARY
+  g_cork_tri_armed = 0;
+#else
   return 0;
 #endif /* not TRILIBRARY */
 }

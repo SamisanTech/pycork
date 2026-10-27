@@ -3,6 +3,7 @@
 #include <exception>
 
 #include <cork/cork.h>
+#include <cork/util/abort.hpp>
 #include <cork/repair/cluster.h>
 #include <cork/repair/holes.h>
 #include <cork/repair/ops.h>
@@ -51,10 +52,18 @@ public:
             };
             try {
                 go();
+            } catch (const TriangleAbort &) {
+                mesh.siUnbounded = true;
+                return;
             } catch (const std::exception &) {
                 if (mesh.siUnbounded) return;
-                drop_noise(mesh, opt.minFaces);
-                go();
+                try {
+                    drop_noise(mesh, opt.minFaces);
+                    go();
+                } catch (const std::exception &) {
+                    mesh.siUnbounded = true;
+                    return;
+                }
             }
             if (mesh.siUnbounded) return;
         }

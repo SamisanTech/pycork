@@ -22,8 +22,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <tuple>
+
+#include "seh_guard.h"
 
 namespace py = pybind11;
 
@@ -283,6 +286,115 @@ void writeSTL(const std::string &path,
 
 // One CorkMesh build, then the optional repair stages. Existing
 // resolveIntersection / outerHull stay as the thin one-kernel bindings.
+// The body runs under an SEH guard: Triangle's exit() is now an exception,
+// and an access violation returns si_aborted instead of killing Mira.
+struct RepairJob {
+    const EigenVecX3d *verts;
+    const EigenVecX3i *tris;
+    bool resolve, hull, unify, cluster, puzzle, clean, perturb, noise, collapse, si_subset, exactHull;
+    int raysPerPatch, minFaces, hardDegree;
+    double perturbIntensity, collapseRel;
+    const std::string *hull_backend;
+    EigenVecX3d *outV;
+    EigenVecX3i *outF;
+    bool produced;
+    bool aborted;
+    long long pairs;
+    long long hits;
+    std::string used;
+    bool fallback;
+    cork::repair::Stats st;
+    char error[160];
+};
+
+static void repair_invoke(void *raw) {
+    auto *job = static_cast<RepairJob *>(raw);
+    job->produced = false;
+    job->aborted = false;
+    job->pairs = 0;
+    job->hits = 0;
+    job->fallback = false;
+    job->outV = nullptr;
+    job->outF = nullptr;
+    job->error[0] = 0;
+    try {
+        job->used = !job->hull ? "off" : (job->exactHull ? "exact" : "ours");
+        CorkMesh mesh;
+        {
+            CORK_PROF("py.eigenToCorkMesh");
+            eigenToCorkMesh(*job->verts, *job->tris, &mesh);
+        }
+        const bool wantManifold = job->hull && !job->exactHull && manifold_hull_requested(*job->hull_backend);
+        cork::repair::Options opt;
+        opt.resolve = job->resolve;
+        opt.hull = job->hull;
+        opt.exactHull = job->exactHull;
+        opt.deferHull = wantManifold;
+        opt.unify = job->unify;
+        opt.cluster = job->cluster;
+        opt.puzzle = job->puzzle;
+        opt.clean = job->clean;
+        opt.perturb = job->perturb;
+        opt.noise = job->noise;
+        opt.collapse = job->collapse;
+        opt.si_subset = job->si_subset;
+        opt.fill = !wantManifold;
+        opt.raysPerPatch = job->raysPerPatch;
+        opt.minFaces = job->minFaces;
+        opt.hardDegree = job->hardDegree;
+        opt.perturbIntensity = job->perturbIntensity;
+        opt.collapseRel = job->collapseRel;
+        cork::repair::Pipeline::run(mesh, opt, &job->st);
+        if (mesh.siUnbounded) {
+            job->aborted = true;
+            job->pairs = mesh.siAbortPairs;
+            job->hits = mesh.siAbortHits;
+            job->produced = true;
+            return;
+        }
+        if (wantManifold) {
+            CORK_PROF("repair.hull.manifold");
+            bool ok = false;
+            try {
+                ok = apply_manifold_union_all(mesh);
+            } catch (const py::error_already_set &) {
+                ok = false;
+            } catch (const std::exception &) {
+                ok = false;
+            }
+            if (ok) {
+                job->used = "manifold";
+            } else {
+                cork_hull::HullStats hs;
+                cork::repair::extract_hull(mesh, opt, &hs);
+                job->used = opt.exactHull ? "exact" : "ours";
+                job->fallback = true;
+            }
+        }
+        auto *ov = new EigenVecX3d();
+        auto *of = new EigenVecX3i();
+        {
+            CORK_PROF("py.corkMesh2Eigen");
+            corkMesh2Eigen(mesh, *ov, *of);
+        }
+        job->outV = ov;
+        job->outF = of;
+        job->produced = true;
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "fast_cork: repair exception: %s\n", e.what());
+        std::fflush(stderr);
+        std::snprintf(job->error, sizeof(job->error), "%s", e.what());
+        job->aborted = true;
+        job->produced = true;
+    } catch (...) {
+        std::fprintf(stderr, "fast_cork: repair unknown exception\n");
+        std::fflush(stderr);
+        std::snprintf(job->error, sizeof(job->error), "unknown");
+        job->aborted = true;
+        job->produced = true;
+    }
+}
+
 std::tuple<EigenVecX3d, EigenVecX3i, py::dict> repair(const EigenVecX3d &verts,
                                                      const EigenVecX3i &tris,
                                                      bool resolve,
@@ -305,67 +417,62 @@ std::tuple<EigenVecX3d, EigenVecX3i, py::dict> repair(const EigenVecX3d &verts,
     CORK_PROF("py.repair total");
     std::fprintf(stderr, "fast_cork: repair enter\n");
     std::fflush(stderr);
-    CorkMesh mesh;
-    {
-        CORK_PROF("py.eigenToCorkMesh");
-        eigenToCorkMesh(verts, tris, &mesh);
-    }
-    const bool wantManifold = hull && !exactHull && manifold_hull_requested(hull_backend);
-    cork::repair::Options opt;
-    opt.resolve = resolve;
-    opt.hull = hull;
-    opt.exactHull = exactHull;
-    opt.deferHull = wantManifold;
-    opt.unify = unify;
-    opt.cluster = cluster;
-    opt.puzzle = puzzle;
-    opt.clean = clean;
-    opt.perturb = perturb;
-    opt.noise = noise;
-    opt.collapse = collapse;
-    opt.si_subset = si_subset;
-    opt.fill = !wantManifold;
-    opt.raysPerPatch = raysPerPatch;
-    opt.minFaces = minFaces;
-    opt.hardDegree = hardDegree;
-    opt.perturbIntensity = perturbIntensity;
-    opt.collapseRel = collapseRel;
-    cork::repair::Stats st;
-    cork::repair::Pipeline::run(mesh, opt, &st);
+    RepairJob job;
+    job.verts = &verts;
+    job.tris = &tris;
+    job.resolve = resolve;
+    job.hull = hull;
+    job.unify = unify;
+    job.cluster = cluster;
+    job.puzzle = puzzle;
+    job.clean = clean;
+    job.perturb = perturb;
+    job.noise = noise;
+    job.collapse = collapse;
+    job.si_subset = si_subset;
+    job.exactHull = exactHull;
+    job.raysPerPatch = raysPerPatch;
+    job.minFaces = minFaces;
+    job.hardDegree = hardDegree;
+    job.perturbIntensity = perturbIntensity;
+    job.collapseRel = collapseRel;
+    job.hull_backend = &hull_backend;
+    job.outV = nullptr;
+    job.outF = nullptr;
+    job.produced = false;
+    job.aborted = false;
+    job.pairs = 0;
+    job.hits = 0;
+    job.fallback = false;
 
-    std::string used = !hull ? "off" : (exactHull ? "exact" : "ours");
-    bool fallback = false;
-    if (wantManifold) {
-        CORK_PROF("repair.hull.manifold");
-        bool ok = false;
-        try {
-            ok = apply_manifold_union_all(mesh);
-        } catch (const py::error_already_set &) {
-            ok = false;
-        } catch (const std::exception &) {
-            ok = false;
-        }
-        if (ok) {
-            used = "manifold";
-        } else {
-            cork_hull::HullStats hs;
-            cork::repair::extract_hull(mesh, opt, &hs);
-            used = opt.exactHull ? "exact" : "ours";
-            fallback = true;
-        }
+    const int native = cork_seh_invoke(repair_invoke, &job);
+    const bool crashed = native != 0 || !job.produced;
+    if (crashed) {
+        std::fprintf(stderr, "fast_cork: repair aborted (native 0x%08X); returning unchanged\n",
+                     (unsigned)native);
+        std::fflush(stderr);
+        delete job.outV;
+        delete job.outF;
+        job.outV = nullptr;
+        job.outF = nullptr;
+        job.aborted = true;
+        job.pairs = 0;
+        job.hits = 0;
     }
 
     std::tuple<EigenVecX3d, EigenVecX3i, py::dict> out;
-    {
-        CORK_PROF("py.corkMesh2Eigen");
-        corkMesh2Eigen(mesh, std::get<0>(out), std::get<1>(out));
+    if (job.outV && job.outF) {
+        std::get<0>(out) = std::move(*job.outV);
+        std::get<1>(out) = std::move(*job.outF);
+        delete job.outV;
+        delete job.outF;
     }
     py::dict d;
     d["resolve"] = resolve;
     d["hull"] = hull;
-    d["hull_backend"] = used;
+    d["hull_backend"] = job.used;
     d["exactHull"] = exactHull;
-    d["hull_fallback"] = fallback;
+    d["hull_fallback"] = job.fallback;
     d["unify"] = unify;
     d["cluster"] = cluster;
     d["puzzle"] = puzzle;
@@ -374,18 +481,20 @@ std::tuple<EigenVecX3d, EigenVecX3i, py::dict> repair(const EigenVecX3d &verts,
     d["noise"] = noise;
     d["collapse"] = collapse;
     d["si_subset"] = si_subset;
-    d["si_aborted"] = mesh.siUnbounded;
-    d["si_cross_pairs"] = mesh.siAbortPairs;
-    d["si_hits"] = mesh.siAbortHits;
+    d["si_aborted"] = job.aborted || crashed;
+    d["si_cross_pairs"] = job.pairs;
+    d["si_hits"] = job.hits;
+    d["si_native"] = (unsigned)(crashed ? native : 0);
     d["raysPerPatch"] = raysPerPatch;
     d["minFaces"] = minFaces;
-    d["shells"] = st.shells;
-    d["clusters"] = st.clusters;
-    d["closed"] = st.closed;
-    d["open"] = st.open;
-    d["hard"] = st.hard;
-    d["unified"] = st.unified;
-    d["puzzled"] = st.puzzled;
+    d["shells"] = job.st.shells;
+    d["clusters"] = job.st.clusters;
+    d["closed"] = job.st.closed;
+    d["open"] = job.st.open;
+    d["hard"] = job.st.hard;
+    d["unified"] = job.st.unified;
+    d["puzzled"] = job.st.puzzled;
+    if (job.error[0]) d["si_error"] = job.error;
     std::get<2>(out) = d;
     return out;
 }
